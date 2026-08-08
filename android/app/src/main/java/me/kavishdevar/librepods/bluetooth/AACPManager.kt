@@ -23,6 +23,7 @@ package me.kavishdevar.librepods.bluetooth
 import android.util.Log
 import me.kavishdevar.librepods.data.Capability
 import me.kavishdevar.librepods.data.CustomEq
+import me.kavishdevar.librepods.data.isHeadTrackingData
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import kotlin.io.encoding.ExperimentalEncodingApi
@@ -215,8 +216,13 @@ class AACPManager {
         identifier: ControlCommandIdentifiers, value: ByteArray
     ) {
         val existingStatus = getControlCommandStatus(identifier)
-        if (existingStatus?.value.contentEquals(value)) {
-            controlCommandStatusList.remove(existingStatus)
+        // Always replace by identifier — previously unequal updates were appended, so
+        // find() kept returning the stale first value (broke Mac→app listening-mode sync).
+        if (existingStatus != null) {
+            controlCommandStatusList.removeAll { it.identifier == identifier }
+            if (existingStatus.value.contentEquals(value)) {
+                // Same value: refresh entry + still notify (reconnect / re-notify paths).
+            }
         }
         controlCommandListeners[identifier]?.forEach { listener ->
             listener.onControlCommandReceived(ControlCommand(identifier.value, value))
@@ -484,13 +490,23 @@ class AACPManager {
             }
 
             Opcodes.HEADTRACKING -> {
-                if (packet.size < 70) {
-                    Log.w(
-                        TAG, "Received HEADTRACKING packet too short: ${
-                        packet.joinToString(" ") {
-                            "%02X".format(it)
-                        }
-                    }")
+                // Real motion samples are 0x17 packets with type 0x44/0x45 at offset 10.
+                // Setup/HID-descriptor 0x17 blobs are also ≥70 bytes but are NOT motion —
+                // feeding them to the gesture detector caused false accept/reject.
+                if (!isHeadTrackingData(packet)) {
+                    if (packet.size < 70) {
+                        Log.w(
+                            TAG, "Received HEADTRACKING packet too short: ${
+                            packet.joinToString(" ") { "%02X".format(it) }
+                        }")
+                    } else {
+                        Log.d(
+                            TAG,
+                            "Ignoring non-motion HEADTRACKING packet (len=${packet.size}, b10=${
+                                packet.getOrNull(10)?.toUByte()?.toString(16)
+                            })"
+                        )
+                    }
                     return
                 }
                 callback?.onHeadTrackingReceived(packet)
@@ -1271,12 +1287,17 @@ class AACPManager {
 
     fun disconnected() {
         Log.d(TAG, "Disconnected, clearing state")
+        // Keep controlCommandListeners — ViewModel registers once and expects them to survive
+        // reconnects. Clearing them left LISTENING_MODE / other status updates unobserved.
         controlCommandStatusList.clear()
-        controlCommandListeners.clear()
         owns = false
         oldConnectedDevices = listOf()
         connectedDevices = listOf()
         audioSource = null
+    }
+
+    fun hasListeningModeStatus(): Boolean {
+        return getControlCommandStatus(ControlCommandIdentifiers.LISTENING_MODE) != null
     }
 
     fun parseInformationPacket(packet: ByteArray): AirPodsInformation {

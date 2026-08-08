@@ -65,8 +65,7 @@ class AirPodsQSService : TileService() {
                 AirPodsNotifications.AIRPODS_CONNECTED -> {
                     Log.d("AirPodsQSService", "Received AIRPODS_CONNECTED")
                     isAirPodsConnected = true
-                    currentAncMode =
-                        ServiceManager.getService()?.getANC() ?: (NoiseControlMode.OFF.ordinal + 1)
+                    currentAncMode = resolveAncMode()
                     updateTile()
                 }
                 AirPodsNotifications.AIRPODS_DISCONNECTED -> {
@@ -81,9 +80,7 @@ class AirPodsQSService : TileService() {
     private val preferenceChangeListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
         if (key == "off_listening_mode") {
             Log.d("AirPodsQSService", "Preference changed: $key")
-            if (currentAncMode == NoiseControlMode.OFF.ordinal + 1 && !isOffModeEnabled()) {
-                currentAncMode = NoiseControlMode.TRANSPARENCY.ordinal + 1
-            }
+            currentAncMode = resolveAncMode()
             updateTile()
         }
     }
@@ -98,13 +95,8 @@ class AirPodsQSService : TileService() {
         super.onStartListening()
         Log.d("AirPodsQSService", "onStartListening")
 
-        val service = ServiceManager.getService()
         isAirPodsConnected = BluetoothConnectionManager.aacpSocket?.isConnected == true
-        currentAncMode = service?.getANC() ?: (NoiseControlMode.OFF.ordinal + 1)
-
-        if (currentAncMode == NoiseControlMode.OFF.ordinal + 1 && !isOffModeEnabled()) {
-             currentAncMode = NoiseControlMode.TRANSPARENCY.ordinal + 1
-        }
+        currentAncMode = resolveAncMode()
 
         val ancIntentFilter = IntentFilter(AirPodsNotifications.ANC_DATA)
         val availabilityIntentFilter = IntentFilter().apply {
@@ -229,6 +221,18 @@ class AirPodsQSService : TileService() {
 
     private fun isOffModeEnabled(): Boolean {
         return sharedPreferences.getBoolean("off_listening_mode", true)
+    }
+
+    /** Prefer live/service mode, then last synced; only remap Off→Transparency when Off is disabled. */
+    private fun resolveAncMode(): Int {
+        val fromService = ServiceManager.getService()?.getANC()?.takeIf { it in 1..4 }
+        val fromPrefs = sharedPreferences.getInt("last_listening_mode", 0).takeIf { it in 1..4 }
+        var mode = fromService ?: fromPrefs ?: NoiseControlMode.ADAPTIVE.ordinal + 1
+        if (mode == NoiseControlMode.OFF.ordinal + 1 && !isOffModeEnabled()) {
+            mode = fromPrefs?.takeIf { it != NoiseControlMode.OFF.ordinal + 1 }
+                ?: (NoiseControlMode.ADAPTIVE.ordinal + 1)
+        }
+        return mode
     }
 
     private fun getAvailableModes(): List<Int> {

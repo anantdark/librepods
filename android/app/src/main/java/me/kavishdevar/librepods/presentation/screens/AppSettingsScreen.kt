@@ -330,6 +330,13 @@ fun AppSettingsScreen(
                     enabled = state.isPremium
                 )
                 StyledToggle(
+                    label = stringResource(R.string.enable_bt_on_incoming_call),
+                    description = stringResource(R.string.enable_bt_on_incoming_call_desc),
+                    checked = state.enableBtOnIncomingCall,
+                    onCheckedChange = viewModel::setEnableBtOnIncomingCall,
+                    enabled = state.isPremium && state.takeoverWhenRingingCall
+                )
+                StyledToggle(
                     label = stringResource(R.string.takeover_media_start),
                     description = stringResource(R.string.takeover_media_start_desc),
                     checked = state.takeoverWhenMediaStart,

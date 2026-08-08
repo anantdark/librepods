@@ -362,7 +362,7 @@ fun AirPodsSettingsScreen(
                         showOffListeningMode = state.offListeningMode,
                         noiseControlModeValue = state.controlStates[AACPManager.Companion.ControlCommandIdentifiers.LISTENING_MODE]?.getOrNull(
                             0
-                        )?.toInt() ?: 3,
+                        )?.toInt() ?: state.ancMode,
                         onNoiseControlModeChanged = {
                             setControlCommandInt(
                                 AACPManager.Companion.ControlCommandIdentifiers.LISTENING_MODE, it

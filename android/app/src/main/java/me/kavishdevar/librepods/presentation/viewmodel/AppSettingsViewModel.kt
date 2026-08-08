@@ -25,6 +25,7 @@ data class AppSettingsUiState(
     val takeoverWhenMusic: Boolean = false,
     val takeoverWhenCall: Boolean = false,
     val takeoverWhenRingingCall: Boolean = false,
+    val enableBtOnIncomingCall: Boolean = false,
     val takeoverWhenMediaStart: Boolean = false,
     val useAlternateHeadTrackingPackets: Boolean = true,
     val conversationalAwarenessVolume: Float = 43f,
@@ -144,6 +145,7 @@ class AppSettingsViewModel(application: Application) : AndroidViewModel(applicat
                 takeoverWhenMusic = sharedPreferences.getBoolean("takeover_when_music", false),
                 takeoverWhenCall = sharedPreferences.getBoolean("takeover_when_call", false),
                 takeoverWhenRingingCall = sharedPreferences.getBoolean("takeover_when_ringing_call", false),
+                enableBtOnIncomingCall = sharedPreferences.getBoolean("enable_bt_on_incoming_call", false),
                 takeoverWhenMediaStart = sharedPreferences.getBoolean("takeover_when_media_start", false),
                 useAlternateHeadTrackingPackets = sharedPreferences.getBoolean("use_alternate_head_tracking_packets", true),
                 conversationalAwarenessVolume = sharedPreferences.getInt("conversational_awareness_volume", 43).toFloat(),
@@ -200,6 +202,11 @@ class AppSettingsViewModel(application: Application) : AndroidViewModel(applicat
     fun setTakeoverWhenRingingCall(enabled: Boolean) {
         sharedPreferences.edit { putBoolean("takeover_when_ringing_call", enabled) }
         _uiState.update { it.copy(takeoverWhenRingingCall = enabled) }
+    }
+
+    fun setEnableBtOnIncomingCall(enabled: Boolean) {
+        sharedPreferences.edit { putBoolean("enable_bt_on_incoming_call", enabled) }
+        _uiState.update { it.copy(enableBtOnIncomingCall = enabled) }
     }
 
     fun setTakeoverWhenMediaStart(enabled: Boolean) {

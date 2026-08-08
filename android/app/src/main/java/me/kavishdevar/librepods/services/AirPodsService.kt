@@ -74,9 +74,11 @@ import androidx.core.content.edit
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -185,7 +187,18 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
     @Volatile private var lastSocketConnectAttemptMs = 0L
     /** True while adapter is off — BLE/media/telephony parked; FGS only waits for BT on. */
     @Volatile var bluetoothOffStandby: Boolean = false
+    /** Set when we enabled BT for an incoming call — takeOver after radio is up. */
+    @Volatile private var pendingCallTakeOverAfterBtEnable: Boolean = false
+    @Volatile private var enablingBluetoothForCall: Boolean = false
         private set
+    /** BT was off and we turned it on for this call — turn it back off when the call ends. */
+    @Volatile private var disableBluetoothAfterCall: Boolean = false
+    /** Keeps retrying L2CAP/takeOver while the phone is ringing until AirPods connect. */
+    @Volatile private var incomingCallConnectJob: Job? = null
+    /** Head-gesture answer/reject deferred until AACP/ownership is ready after takeOver. */
+    @Volatile private var pendingHeadGesturesForCall: Boolean = false
+    /** Phone battery receiver is registered (unregistered in BT-off standby to avoid wakeups). */
+    @Volatile private var phoneBatteryReceiverRegistered: Boolean = false
 
     data class ServiceConfig(
         var deviceName: String = "AirPods",
@@ -208,6 +221,8 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
         // Phone state-based takeover
         var takeoverWhenRingingCall: Boolean = true,
         var takeoverWhenMediaStart: Boolean = true,
+        /** Root: turn Bluetooth on when an incoming call arrives while BT is off. */
+        var enableBtOnIncomingCall: Boolean = false,
 
         var leftSinglePressAction: StemAction = StemAction.defaultActions[StemPressType.SINGLE_PRESS]!!,
         var rightSinglePressAction: StemAction = StemAction.defaultActions[StemPressType.SINGLE_PRESS]!!,
@@ -403,6 +418,9 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
         // Defaults before the listener so first-run stem keys don't spam setupStemActions.
         ensureDefaultPreferences()
         initializeConfig()
+        sharedPreferences.getInt("last_listening_mode", 0).takeIf { it in 1..4 }?.let { mode ->
+            ancNotification.setStatus(byteArrayOf(mode.toByte()))
+        }
 
         sharedPreferences.registerOnSharedPreferenceChangeListener(this)
 
@@ -494,51 +512,50 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
             override fun onCallStateChanged(state: Int) {
                 when (state) {
                     TelephonyManager.CALL_STATE_RINGING -> {
-                        val leAvailableForAudio =
-                            bleManager.getMostRecentStatus()?.isLeftInEar == true || bleManager.getMostRecentStatus()?.isRightInEar == true
-//                        if ((CrossDevice.isAvailable && !isConnectedLocally && earDetectionNotification.status.contains(0x00)) || leAvailableForAudio) CoroutineScope(Dispatchers.IO).launch {
-                        if (leAvailableForAudio) CoroutineScope(Dispatchers.IO).launch {
-                            takeOver("call")
-                        }
+                        isRinging = true
+                        handleIncomingCallTakeOver()
+                        enableStemCaptureForIncomingCall()
+                        // Starts now if AACP is up; otherwise deferred until takeOver / connect.
                         if (config.headGestures) {
                             handleIncomingCall()
                         }
                     }
 
                     TelephonyManager.CALL_STATE_OFFHOOK -> {
-                        val leAvailableForAudio =
-                            bleManager.getMostRecentStatus()?.isLeftInEar == true || bleManager.getMostRecentStatus()?.isRightInEar == true
-//                        if ((CrossDevice.isAvailable && !isConnectedLocally && earDetectionNotification.status.contains(0x00)) || leAvailableForAudio) CoroutineScope(
-                        if (leAvailableForAudio) CoroutineScope(
-                            Dispatchers.IO
-                        ).launch {
-                            takeOver("call")
+                        isRinging = false
+                        // If we just enabled BT for RINGING, takeOver is already pending.
+                        if (!pendingCallTakeOverAfterBtEnable && !enablingBluetoothForCall) {
+                            handleIncomingCallTakeOver()
                         }
                         isInCall = true
+                        pendingHeadGesturesForCall = false
+                        handleIncomingCallOnceConnected = false
+                        // Drop ring-time stem customization only; keep ownership until call ends.
+                        restoreStemConfigAfterCall(releaseOwnership = false)
+                        // In-call: head gestures stay dormant (no HT packets / detector loop).
+                        stopHeadGesturesForCall()
                     }
 
                     TelephonyManager.CALL_STATE_IDLE -> {
+                        isRinging = false
                         isInCall = false
-                        gestureDetector?.stopDetection()
+                        pendingCallTakeOverAfterBtEnable = false
+                        enablingBluetoothForCall = false
+                        pendingHeadGesturesForCall = false
+                        handleIncomingCallOnceConnected = false
+                        stopIncomingCallConnectRetry()
+                        // Give stem / connection ownership back to Mac (or prior owner).
+                        restoreStemConfigAfterCall(releaseOwnership = true)
+                        stopHeadGesturesForCall()
+                        maybeDisableBluetoothAfterCall()
                     }
                 }
             }
         }
-        // Telephony callback is registered only while Bluetooth is on (see exitBluetoothOffStandby).
-
+        // Telephony: registered while BT is on, or while BT-off + enable-BT-on-call (event-driven only).
         if (config.showPhoneBatteryInWidget) {
             widgetMobileBatteryEnabled = true
-            val batteryChangedIntentFilter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
-            batteryChangedIntentFilter.addAction(AirPodsNotifications.DISCONNECT_RECEIVERS)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                registerReceiver(
-                    BatteryChangedIntentReceiver, batteryChangedIntentFilter, RECEIVER_EXPORTED
-                )
-            } else {
-                @Suppress("UnspecifiedRegisterReceiverFlag") registerReceiver(
-                    BatteryChangedIntentReceiver, batteryChangedIntentFilter
-                )
-            }
+            registerPhoneBatteryReceiverIfNeeded()
         }
         val serviceIntentFilter = IntentFilter().apply {
             addAction("android.bluetooth.device.action.ACL_CONNECTED")
@@ -709,12 +726,16 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
         } else {
             Log.d(TAG, "Bluetooth off at service create — entering deep standby")
             enterBluetoothOffStandby()
+            // Keep call listener alive when root enable-BT-on-call is on.
+            syncTelephonyForBtOffStandby()
         }
     }
 
     /**
      * Bluetooth radio off: stop LE scan, drop presence, and unregister media/telephony
      * callbacks. Service stays alive only to catch the next adapter-on broadcast.
+     * Telephony stays registered when [config.enableBtOnIncomingCall] so we can wake BT on ring
+     * (system call-state callbacks only — no polling / BLE).
      */
     fun enterBluetoothOffStandby() {
         if (bluetoothOffStandby) {
@@ -731,17 +752,12 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
         }
 
         MediaController.setMonitoringEnabled(false)
+        // ACTION_BATTERY_CHANGED wakes often — drop it while BT is off.
+        unregisterPhoneBatteryReceiverIfNeeded()
+        stopHeadGesturesForCall()
 
-        if (this::telephonyManager.isInitialized && this::phoneStateListener.isInitialized) {
-            try {
-                if (checkSelfPermission("android.permission.READ_PHONE_STATE") ==
-                    PackageManager.PERMISSION_GRANTED
-                ) {
-                    telephonyManager.unregisterTelephonyCallback(phoneStateListener)
-                }
-            } catch (e: Exception) {
-                Log.w(TAG, "Failed parking telephony: ${e.message}")
-            }
+        if (!shouldKeepTelephonyWhileBtOff()) {
+            unregisterTelephonyCallbackSafe()
         }
 
         try {
@@ -777,32 +793,235 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
                     bleManager.startScanning(BLEManager.ScanPowerMode.LOW_POWER)
                 }
             }
+            maybeTakeOverAfterBtEnabledForCall()
             return
         }
         bluetoothOffStandby = false
         Log.i(TAG, "Exiting Bluetooth-off standby — resuming low-power scan")
 
         MediaController.setMonitoringEnabled(true)
-
-        if (this::telephonyManager.isInitialized && this::phoneStateListener.isInitialized) {
-            try {
-                if (checkSelfPermission("android.permission.READ_PHONE_STATE") ==
-                    PackageManager.PERMISSION_GRANTED
-                ) {
-                    telephonyManager.registerTelephonyCallback(mainExecutor, phoneStateListener)
-                }
-            } catch (e: Exception) {
-                Log.w(TAG, "Failed resuming telephony: ${e.message}")
-            }
-        }
+        registerTelephonyCallbackSafe()
+        registerPhoneBatteryReceiverIfNeeded()
 
         CoroutineScope(Dispatchers.IO).launch {
             bleManager.startScanning(BLEManager.ScanPowerMode.LOW_POWER)
         }
+        maybeTakeOverAfterBtEnabledForCall()
+    }
+
+    private fun shouldKeepTelephonyWhileBtOff(): Boolean {
+        return config.enableBtOnIncomingCall && config.takeoverWhenRingingCall
+    }
+
+    private fun syncTelephonyForBtOffStandby() {
+        if (!bluetoothOffStandby) return
+        if (shouldKeepTelephonyWhileBtOff()) {
+            registerTelephonyCallbackSafe()
+        } else {
+            unregisterTelephonyCallbackSafe()
+        }
+    }
+
+    private fun registerTelephonyCallbackSafe() {
+        if (!this::telephonyManager.isInitialized || !this::phoneStateListener.isInitialized) return
+        try {
+            if (checkSelfPermission("android.permission.READ_PHONE_STATE") ==
+                PackageManager.PERMISSION_GRANTED
+            ) {
+                telephonyManager.registerTelephonyCallback(mainExecutor, phoneStateListener)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed registering telephony: ${e.message}")
+        }
+    }
+
+    private fun unregisterTelephonyCallbackSafe() {
+        if (!this::telephonyManager.isInitialized || !this::phoneStateListener.isInitialized) return
+        try {
+            if (checkSelfPermission("android.permission.READ_PHONE_STATE") ==
+                PackageManager.PERMISSION_GRANTED
+            ) {
+                telephonyManager.unregisterTelephonyCallback(phoneStateListener)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed unregistering telephony: ${e.message}")
+        }
+    }
+
+    private fun registerPhoneBatteryReceiverIfNeeded() {
+        if (!config.showPhoneBatteryInWidget || phoneBatteryReceiverRegistered) return
+        if (bluetoothOffStandby) return
+        val filter = IntentFilter(Intent.ACTION_BATTERY_CHANGED).apply {
+            addAction(AirPodsNotifications.DISCONNECT_RECEIVERS)
+        }
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                registerReceiver(BatteryChangedIntentReceiver, filter, RECEIVER_EXPORTED)
+            } else {
+                @Suppress("UnspecifiedRegisterReceiverFlag")
+                registerReceiver(BatteryChangedIntentReceiver, filter)
+            }
+            phoneBatteryReceiverRegistered = true
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed registering battery receiver: ${e.message}")
+        }
+    }
+
+    private fun unregisterPhoneBatteryReceiverIfNeeded() {
+        if (!phoneBatteryReceiverRegistered) return
+        try {
+            unregisterReceiver(BatteryChangedIntentReceiver)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed unregistering battery receiver: ${e.message}")
+        }
+        phoneBatteryReceiverRegistered = false
+    }
+
+    private fun enableBluetoothViaRoot(): Boolean {
+        return try {
+            val process = Runtime.getRuntime().exec(arrayOf("su", "-c", "svc bluetooth enable"))
+            val finished = process.waitFor(5, TimeUnit.SECONDS)
+            if (!finished) {
+                process.destroyForcibly()
+                Log.w(TAG, "svc bluetooth enable timed out")
+                false
+            } else {
+                val code = process.exitValue()
+                Log.d(TAG, "svc bluetooth enable exited $code")
+                code == 0
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to enable Bluetooth via root", e)
+            false
+        }
+    }
+
+    private fun disableBluetoothViaRoot(): Boolean {
+        return try {
+            val process = Runtime.getRuntime().exec(arrayOf("su", "-c", "svc bluetooth disable"))
+            val finished = process.waitFor(5, TimeUnit.SECONDS)
+            if (!finished) {
+                process.destroyForcibly()
+                Log.w(TAG, "svc bluetooth disable timed out")
+                false
+            } else {
+                val code = process.exitValue()
+                Log.d(TAG, "svc bluetooth disable exited $code")
+                code == 0
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to disable Bluetooth via root", e)
+            false
+        }
+    }
+
+    /** If we enabled BT only for this call, turn it back off 5s after hang-up. */
+    private fun maybeDisableBluetoothAfterCall() {
+        if (!disableBluetoothAfterCall) {
+            Log.d(TAG, "Call ended — leaving Bluetooth on (was already on before the call)")
+            return
+        }
+        disableBluetoothAfterCall = false
+        Log.i(TAG, "Call ended — will disable Bluetooth in 5s (was off before this call)")
+        CoroutineScope(Dispatchers.IO).launch {
+            // Let ownership-release / stem-restore packets go out; give audio a moment to settle.
+            delay(5_000)
+            if (isRinging || isInCall) {
+                Log.d(TAG, "Skipping BT disable — another call started")
+                return@launch
+            }
+            val ok = disableBluetoothViaRoot()
+            if (ok) {
+                // Park immediately; STATE_OFF will also call enterBluetoothOffStandby.
+                enterBluetoothOffStandby()
+            }
+        }
+    }
+
+    /**
+     * While ringing (and briefly after answer if still not linked), keep attempting takeOver
+     * until AACP is up. Stops on IDLE or successful connect.
+     */
+    private fun startIncomingCallConnectRetry() {
+        if (!config.takeoverWhenRingingCall) return
+        if (incomingCallConnectJob?.isActive == true) {
+            Log.d(TAG, "Incoming call connect retry already running")
+            return
+        }
+        incomingCallConnectJob = CoroutineScope(Dispatchers.IO).launch {
+            var attempt = 0
+            while (isActive && (isRinging || isInCall)) {
+                if (BluetoothConnectionManager.aacpSocket?.isConnected == true) {
+                    Log.d(TAG, "AirPods connected — stopping incoming-call connect retry")
+                    break
+                }
+                if (bluetoothOffStandby || bleManager.isBluetoothOffParked()) {
+                    delay(800)
+                    continue
+                }
+                attempt++
+                Log.d(TAG, "Incoming call: connect/takeOver retry #$attempt")
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    try {
+                        takeOver("call")
+                    } catch (e: Exception) {
+                        Log.w(TAG, "takeOver retry failed: ${e.message}")
+                    }
+                }
+                // Back off a bit between attempts so we don't storm L2CAP.
+                delay(2_000)
+            }
+        }
+    }
+
+    private fun stopIncomingCallConnectRetry() {
+        incomingCallConnectJob?.cancel()
+        incomingCallConnectJob = null
+    }
+
+    private fun maybeTakeOverAfterBtEnabledForCall() {
+        if (!pendingCallTakeOverAfterBtEnable) return
+        pendingCallTakeOverAfterBtEnable = false
+        enablingBluetoothForCall = false
+        // Keep trying for the whole ring; one-shot BLE wait alone often misses the pods.
+        startIncomingCallConnectRetry()
+    }
+
+    private fun handleIncomingCallTakeOver() {
+        val adapter = getSystemService(BluetoothManager::class.java)?.adapter
+        val btWasOff = bluetoothOffStandby || adapter?.isEnabled != true
+        if (btWasOff && config.enableBtOnIncomingCall && config.takeoverWhenRingingCall) {
+            if (enablingBluetoothForCall) {
+                Log.d(TAG, "Already enabling Bluetooth for incoming call")
+                startIncomingCallConnectRetry()
+                return
+            }
+            Log.i(TAG, "Incoming call with BT off — enabling via root")
+            enablingBluetoothForCall = true
+            pendingCallTakeOverAfterBtEnable = true
+            // Only auto-disable after hang-up if BT was off when the call arrived.
+            disableBluetoothAfterCall = true
+            CoroutineScope(Dispatchers.IO).launch {
+                val ok = enableBluetoothViaRoot()
+                if (!ok) {
+                    enablingBluetoothForCall = false
+                    pendingCallTakeOverAfterBtEnable = false
+                    disableBluetoothAfterCall = false
+                    Log.w(TAG, "Could not enable Bluetooth for incoming call")
+                }
+                // takeOver retries start from exitBluetoothOffStandby when STATE_ON arrives
+            }
+            startIncomingCallConnectRetry()
+            return
+        }
+        // BT was already on — never turn it off when this call ends.
+        disableBluetoothAfterCall = false
+        startIncomingCallConnectRetry()
     }
 
     @Suppress("unused")
     fun cameraOpened() {
+        if (bluetoothOffStandby || bleManager.isBluetoothOffParked()) return
         Log.d(TAG, "Camera opened, gonna handle stem presses and take action if visible")
         cameraActive = true
         setupStemActions()
@@ -810,6 +1029,10 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
 
     @Suppress("unused")
     fun cameraClosed() {
+        if (bluetoothOffStandby || bleManager.isBluetoothOffParked()) {
+            cameraActive = false
+            return
+        }
         cameraActive = false
         setupStemActions()
     }
@@ -842,6 +1065,8 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
     }
 
     fun setupStemActions() {
+        if (bluetoothOffStandby || bleManager.isBluetoothOffParked()) return
+        if (BluetoothConnectionManager.aacpSocket?.isConnected != true) return
         val singlePressDefault = StemAction.defaultActions[StemPressType.SINGLE_PRESS]
         val doublePressDefault = StemAction.defaultActions[StemPressType.DOUBLE_PRESS]
         val triplePressDefault = StemAction.defaultActions[StemPressType.TRIPLE_PRESS]
@@ -903,9 +1128,14 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
                     )
                 }
 
-                if (batteryNotification.getBattery()[0].status == BatteryStatus.CHARGING && batteryNotification.getBattery()[1].status == BatteryStatus.CHARGING) {
+                val bothCharging =
+                    batteryNotification.getBattery()[0].status == BatteryStatus.CHARGING &&
+                        batteryNotification.getBattery()[1].status == BatteryStatus.CHARGING
+                if (bothCharging) {
                     disconnectAudio(this@AirPodsService, device)
-                } else {
+                } else if (!otherDeviceIsAudioSource()) {
+                    // Don't fight Mac/other device for A2DP on every battery packet — that
+                    // churns ACL and drops AACP (and with it listening-mode sync).
                     connectAudio(this@AirPodsService, device)
                 }
             }
@@ -950,8 +1180,12 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
             override fun onControlCommandReceived(controlCommand: ByteArray) {
                 val command = AACPManager.ControlCommand.fromByteArray(controlCommand)
                 if (command.identifier == AACPManager.Companion.ControlCommandIdentifiers.LISTENING_MODE.value) {
-                    ancNotification.setStatus(byteArrayOf(command.value.takeIf { it.isNotEmpty() }
-                        ?.get(0) ?: 0x00.toByte()))
+                    val mode = command.value.takeIf { it.isNotEmpty() }?.get(0) ?: 0x00.toByte()
+                    ancNotification.setStatus(byteArrayOf(mode))
+                    if (mode.toInt() in 1..4) {
+                        sharedPreferences.edit { putInt("last_listening_mode", mode.toInt()) }
+                        Log.d(TAG, "Listening mode synced from AirPods: ${mode.toInt()}")
+                    }
                     sendANCBroadcast()
                     updateNoiseControlWidget()
                 }
@@ -1097,9 +1331,28 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
 
             @SuppressLint("NewApi")
             override fun onHeadTrackingReceived(headTracking: ByteArray) {
-                if (isHeadTrackingActive) {
-                    HeadTracking.processPacket(headTracking)
+                // Dormant unless HT explicitly started (ringing gestures or Head Tracking screen).
+                if (!isHeadTrackingActive) return
+                validHeadTrackingSamples++
+                HeadTracking.processPacket(headTracking)
+                val horizontal =
+                    ByteBuffer.wrap(headTracking, 51, 2).order(ByteOrder.LITTLE_ENDIAN).short.toInt()
+                val vertical =
+                    ByteBuffer.wrap(headTracking, 53, 2).order(ByteOrder.LITTLE_ENDIAN).short.toInt()
+                val now = SystemClock.elapsedRealtime()
+                if (now - lastHtSampleLogMs >= 200L) {
+                    lastHtSampleLogMs = now
+                    Log.d(
+                        TAG,
+                        "HT sample #$validHeadTrackingSamples h=$horizontal v=$vertical"
+                    )
+                }
+                // Call nod/shake only while ringing — never while in-call or idle.
+                if (isRinging && !isInCall) {
                     processHeadTrackingData(headTracking)
+                } else {
+                    // Head Tracking screen / test: still feed detector if it's armed.
+                    gestureDetector?.processHeadOrientation(horizontal, vertical)
                 }
             }
 
@@ -1120,8 +1373,15 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
 
                 Log.d(
                     "AirPodsParser",
-                    "Stem press received: $stemPressType on $bud, cameraActive: $cameraActive, cameraAction: ${config.cameraAction}"
+                    "Stem press received: $stemPressType on $bud, cameraActive: $cameraActive, cameraAction: ${config.cameraAction}, ringing=$isRinging"
                 )
+                // While the phone is ringing, stem taps must answer here — otherwise AirPods
+                // may deliver the gesture to Mac (connection owner) even when call audio is local.
+                if (isRinging && stemPressType == StemPressType.SINGLE_PRESS) {
+                    Log.d(TAG, "Single stem press while ringing — answering on phone")
+                    answerCall()
+                    return
+                }
                 if (cameraActive && config.cameraAction != null && stemPressType == config.cameraAction) {
                     Log.d(TAG, "Camera stem action matched, injecting shutter")
                     injectCameraShutter()
@@ -1133,23 +1393,26 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
             }
 
             override fun onAudioSourceReceived(audioSource: ByteArray) {
+                val src = aacpManager.audioSource
                 Log.d(
                     "AirPodsParser",
-                    "Audio source changed mac: ${aacpManager.audioSource?.mac}, type: ${aacpManager.audioSource?.type?.name}"
+                    "Audio source changed mac: ${src?.mac}, type: ${src?.type?.name}"
                 )
-                if (localMac!="" && (aacpManager.audioSource?.type != AACPManager.Companion.AudioSourceType.NONE && aacpManager.audioSource?.mac != localMac)) {
+                val otherIsSource = localMac != "" &&
+                    src?.type != AACPManager.Companion.AudioSourceType.NONE &&
+                    src?.mac != null &&
+                    src.mac != localMac
+                if (otherIsSource) {
+                    // Mac/other owns audio — expected that AirPods may drop our AACP after ~45s.
+                    // Do NOT send OWNS_CONNECTION=0: that suppresses LISTENING_MODE notifications
+                    // while we are still connected, so Mac→app mode changes never appear.
                     Log.d(
                         "AirPodsParser",
-                        "Audio source is another device, better to give up aacp control"
+                        "Audio source is another device — keep AACP for status sync (no OWNS=0)"
                     )
-                    aacpManager.sendControlCommand(
-                        AACPManager.Companion.ControlCommandIdentifiers.OWNS_CONNECTION.value,
-                        byteArrayOf(0x00)
-                    )
-                    // this also means that the other device has start playing the audio, and if that's true, we can again start listening for audio config changes
-//                    Log.d(TAG, "Another device started playing audio, listening for audio config changes again")
-//                    MediaController.pausedForOtherDevice = false
-// future me: what the heck is this? this just means it will not be taking over again if audio source doesn't change???
+                    if (!aacpManager.hasListeningModeStatus()) {
+                        aacpManager.sendNotificationRequest()
+                    }
                 }
             }
 
@@ -1425,6 +1688,9 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
                 if (!contains("takeover_when_media_start")) putBoolean(
                     "takeover_when_media_start", false
                 )
+                if (!contains("enable_bt_on_incoming_call")) putBoolean(
+                    "enable_bt_on_incoming_call", false
+                )
 
                 if (!contains("adaptive_strength")) putInt("adaptive_strength", 51)
                 if (!contains("tone_volume")) putInt("tone_volume", 75)
@@ -1565,6 +1831,9 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
             takeoverWhenMediaStart = sharedPreferences.getBoolean(
                 "takeover_when_media_start", false
             ),
+            enableBtOnIncomingCall = sharedPreferences.getBoolean(
+                "enable_bt_on_incoming_call", false
+            ),
 
             // Stem actions
             leftSinglePressAction = StemAction.fromString(
@@ -1651,6 +1920,11 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
             "show_phone_battery_in_widget" -> {
                 config.showPhoneBatteryInWidget = preferences.getBoolean(key, true)
                 widgetMobileBatteryEnabled = config.showPhoneBatteryInWidget
+                if (widgetMobileBatteryEnabled) {
+                    registerPhoneBatteryReceiverIfNeeded()
+                } else {
+                    unregisterPhoneBatteryReceiverIfNeeded()
+                }
                 updateBattery()
             }
 
@@ -1676,11 +1950,18 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
             "takeover_when_call" -> config.takeoverWhenCall = preferences.getBoolean(key, true)
 
             // Phone state-based takeover
-            "takeover_when_ringing_call" -> config.takeoverWhenRingingCall =
-                preferences.getBoolean(key, true)
+            "takeover_when_ringing_call" -> {
+                config.takeoverWhenRingingCall = preferences.getBoolean(key, true)
+                syncTelephonyForBtOffStandby()
+            }
 
             "takeover_when_media_start" -> config.takeoverWhenMediaStart =
                 preferences.getBoolean(key, true)
+
+            "enable_bt_on_incoming_call" -> {
+                config.enableBtOnIncomingCall = preferences.getBoolean(key, false)
+                syncTelephonyForBtOffStandby()
+            }
 
             "left_single_press_action" -> {
                 config.leftSinglePressAction = StemAction.fromString(
@@ -1821,6 +2102,14 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
 
     private var gestureDetector: GestureDetector? = null
     private var isInCall = false
+    @Volatile private var isRinging = false
+    /** Stem config temporarily customized so single-press reaches the phone while ringing. */
+    @Volatile private var stemCustomizedForCall = false
+    /**
+     * True when we claimed OWNS_CONNECTION for an incoming call while Mac/other previously owned.
+     * Cleared by releasing ownership after the call ends.
+     */
+    @Volatile private var releaseOwnershipAfterCall = false
     private var callNumber: String? = null
 
     private fun initGestureDetector() {
@@ -2318,33 +2607,80 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
         notificationManager.cancel(1)
     }
 
+    /**
+     * Arm nod=accept / shake=reject only while the phone is ringing.
+     * Head tracking + detector stay dormant on idle and during an active call.
+     */
     fun handleIncomingCall() {
-        if (isInCall) return
-        if (config.headGestures) {
-            initGestureDetector()
-            startHeadTracking(allowOwnershipClaim = true)
-            gestureDetector?.startDetection { accepted ->
-                if (accepted) {
-                    answerCall()
-                    handleIncomingCallOnceConnected = false
-                } else {
-                    rejectCall()
-                    handleIncomingCallOnceConnected = false
-                }
+        if (isInCall || !isRinging) return
+        if (!config.headGestures) return
+        if (bluetoothOffStandby || bleManager.isBluetoothOffParked() ||
+            BluetoothConnectionManager.aacpSocket?.isConnected != true
+        ) {
+            pendingHeadGesturesForCall = true
+            Log.d(TAG, "Deferring head gestures for incoming call until AACP is ready")
+            return
+        }
+        pendingHeadGesturesForCall = false
+        Log.d(TAG, "Starting head gestures for incoming call (nod=accept, shake=reject)")
+        initGestureDetector()
+        // Restart cleanly so a prior session / ownership claim doesn't leave detection stuck.
+        stopHeadGesturesForCall()
+        // startDetection enables HT packets + the detector loop.
+        gestureDetector?.startDetection { accepted ->
+            if (!isRinging || isInCall) return@startDetection
+            if (accepted) {
+                Log.d(TAG, "Head gesture accept — answering call")
+                answerCall()
+                gestureDetector?.playActionChime(accepted = true)
+            } else {
+                Log.d(TAG, "Head gesture reject — ending call")
+                rejectCall()
+                gestureDetector?.playActionChime(accepted = false)
             }
+            handleIncomingCallOnceConnected = false
+            stopHeadGesturesForCall()
+        }
+    }
 
+    /** Fully stop gesture detector + HT stream (used when leaving RINGING). */
+    private fun stopHeadGesturesForCall() {
+        pendingHeadGesturesForCall = false
+        if (isHeadTrackingActive) {
+            Log.d(TAG, "Stopping head gestures (dormant until next ring)")
+        }
+        // stopHeadTracking also stops the detector without re-entrancy.
+        stopHeadTracking()
+    }
+
+    /** After call takeOver / AACP up — arm nod/shake if still ringing. */
+    private fun maybeStartHeadGesturesAfterCallTakeOver() {
+        if (!config.headGestures) return
+        if (!isRinging || isInCall) return
+        Handler(Looper.getMainLooper()).post {
+            if (!isRinging || isInCall) return@post
+            handleIncomingCall()
         }
     }
 
     @OptIn(ExperimentalCoroutinesApi::class)
     suspend fun testHeadGestures(): Boolean {
+        initGestureDetector()
+        val detector = gestureDetector
+            ?: throw IllegalStateException("Gesture detector unavailable")
         return suspendCancellableCoroutine { continuation ->
-            gestureDetector?.startDetection(doNotStop = true) { accepted ->
+            Log.d(TAG, "testHeadGestures: arming detector (nod=Yes, shake=No)")
+            detector.startDetection(doNotStop = true) { accepted ->
+                // Test UI: chime after the gesture is recognized (no telephony action).
+                detector.playActionChime(accepted)
                 if (continuation.isActive) {
                     continuation.resume(accepted) { _, _, _ ->
-                        gestureDetector?.stopDetection()
+                        detector.stopDetection()
                     }
                 }
+            }
+            continuation.invokeOnCancellation {
+                detector.stopDetection()
             }
         }
     }
@@ -2693,6 +3029,61 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
         return START_STICKY
     }
 
+    /**
+     * Phone-state + AirPods-status takeover gates from App Settings.
+     * Used for both cold connect and already-connected hijack paths.
+     */
+    private fun isTakeOverAllowedByPrefs(takingOverFor: String): Boolean {
+        if (takingOverFor == "reverse") return true
+
+        val shouldTakeOverPState = when (takingOverFor) {
+            "music" -> config.takeoverWhenMediaStart
+            "call" -> config.takeoverWhenRingingCall
+            else -> false
+        }
+        if (!shouldTakeOverPState) {
+            Log.d(TAG, "Not taking over: phone-state toggle off for $takingOverFor")
+            return false
+        }
+
+        val airPodsState = resolveAirPodsTakeOverState()
+        val shouldTakeOver = when (airPodsState) {
+            "Disconnected", "Unknown" -> config.takeoverWhenDisconnected
+            "Idle" -> config.takeoverWhenIdle
+            "Music" -> config.takeoverWhenMusic
+            "Call", "Ringing", "Hanging Up" -> config.takeoverWhenCall
+            else -> false
+        }
+        if (!shouldTakeOver) {
+            Log.d(
+                TAG,
+                "Not taking over: AirPods-status toggle off for state=$airPodsState"
+            )
+            return false
+        }
+        return true
+    }
+
+    /**
+     * Prefer BLE proximity state; when AACP is up BLE scan is stopped so fall back to
+     * AACP audio-source type (Mac playing media / on call).
+     */
+    private fun resolveAirPodsTakeOverState(): String {
+        val bleState = bleManager.getMostRecentStatus()?.connectionState
+        if (bleState != null && bleState != "Unknown") return bleState
+
+        val src = aacpManager.audioSource
+        if (src != null && src.mac != null && src.mac != localMac) {
+            return when (src.type) {
+                AACPManager.Companion.AudioSourceType.MEDIA -> "Music"
+                AACPManager.Companion.AudioSourceType.CALL -> "Call"
+                AACPManager.Companion.AudioSourceType.NONE -> "Idle"
+                else -> "Idle"
+            }
+        }
+        return bleState ?: "Disconnected"
+    }
+
     @RequiresApi(Build.VERSION_CODES.R)
     @SuppressLint("MissingPermission", "HardwareIds")
     fun takeOver(
@@ -2726,7 +3117,11 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
             TAG, "owns connection: $ownsConnection"
         )
         if (BluetoothConnectionManager.aacpSocket?.isConnected == true) {
-            if (!XposedRemotePrefProvider.create().getBoolean("vendor_id_hook", false) || ownsConnection == 0) {
+            val vendorHook =
+                XposedRemotePrefProvider.create().getBoolean("vendor_id_hook", false)
+            // ownsConnection==0 used to abort here, which blocked claiming ownership while Mac
+            // still owned — stem taps kept going to Mac even when call audio was on the phone.
+            if (!vendorHook && takingOverFor != "call" && takingOverFor != "reverse") {
                 Log.d(TAG, "not taking over, vendorid is probably not set to apple")
                 return
             }
@@ -2736,8 +3131,12 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
                     aacpManager.audioSource?.type != AACPManager.Companion.AudioSourceType.NONE
             // null ownership is unknown — hijacking then causes A2DP/ACL reconnect storms.
             val needsHijack =
-                (ownsConnection != null && ownsConnection != 1) || otherDeviceIsSource
+                (ownsConnection != null && ownsConnection != 1) || otherDeviceIsSource ||
+                    takingOverFor == "call"
             if (needsHijack) {
+                if (!isTakeOverAllowedByPrefs(takingOverFor)) {
+                    return
+                }
                 if (disconnectedBecauseReversed) {
                     if (manualTakeOverAfterReversed) {
                         Log.d(TAG, "forcefully taking over despite reverse as user requested")
@@ -2752,6 +3151,9 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
                 }
 
                 Log.d(TAG, "already connected locally, hijacking connection by asking AirPods")
+                if (takingOverFor == "call") {
+                    markReleaseOwnershipAfterCallIfNeeded(ownsConnection)
+                }
                 aacpManager.sendControlCommand(
                     AACPManager.Companion.ControlCommandIdentifiers.OWNS_CONNECTION.value, 1
                 )
@@ -2766,6 +3168,10 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
                 )
                 otherDeviceTookOver = false
                 connectAudio(this, device)
+                if (takingOverFor == "call") {
+                    enableStemCaptureForIncomingCall()
+                    maybeStartHeadGesturesAfterCallTakeOver()
+                }
                 showIsland(
                     this,
                     batteryNotification.getBattery()
@@ -2784,7 +3190,10 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
                     } else if (startHeadTrackingAgain) {
                         Log.d(TAG, "Starting head tracking again after taking control")
                         Handler(Looper.getMainLooper()).postDelayed({
-                            startHeadTracking(allowOwnershipClaim = true)
+                            // Only while still ringing — stay dormant in-call / idle.
+                            if (isRinging && config.headGestures) {
+                                maybeStartHeadGesturesAfterCallTakeOver()
+                            }
                         }, 500)
                     }
                     delay(1000) // should ideally have a callback when it's taken over because for some reason android doesn't dispatch when it's paused
@@ -2798,54 +3207,39 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
                     TAG,
                     "Already connected locally; skipping hijack (owns=$ownsConnection, otherSource=$otherDeviceIsSource)"
                 )
+                if (takingOverFor == "call") {
+                    // Audio may already be local; still claim ownership so stem answer hits phone.
+                    markReleaseOwnershipAfterCallIfNeeded(ownsConnection)
+                    aacpManager.sendControlCommand(
+                        AACPManager.Companion.ControlCommandIdentifiers.OWNS_CONNECTION.value, 1
+                    )
+                    enableStemCaptureForIncomingCall()
+                    maybeStartHeadGesturesAfterCallTakeOver()
+                }
                 if (startHeadTrackingAgain) {
                     Handler(Looper.getMainLooper()).post {
-                        startHeadTracking(allowOwnershipClaim = true)
+                        // Only while still ringing — stay dormant in-call / idle.
+                        if (isRinging && config.headGestures) {
+                            maybeStartHeadGesturesAfterCallTakeOver()
+                        }
                     }
                 }
             }
             return
         }
 
-//        if (CrossDevice.isAvailable) {
-//            Log.d(TAG, "CrossDevice is available, continuing")
-//        }
-//        else if (bleManager.getMostRecentStatus()?.isLeftInEar == true || bleManager.getMostRecentStatus()?.isRightInEar == true) {
-//            Log.d(TAG, "At least one AirPod is in ear, continuing")
-//        }
-//        else {
-//            Log.d(TAG, "CrossDevice not available and AirPods not in ear, skipping")
-//            return
-//        }
-
-        if (bleManager.getMostRecentStatus()?.isLeftInEar == false && bleManager.getMostRecentStatus()?.isRightInEar == false) {
-            Log.d(TAG, "Both AirPods are out of ear, not taking over audio")
-            return
+        // During an incoming/active call, keep trying even if BLE hasn't reported in-ear yet
+        // (common right after we wake BT). Other takeovers still require in-ear.
+        if (takingOverFor != "call") {
+            if (bleManager.getMostRecentStatus()?.isLeftInEar == false &&
+                bleManager.getMostRecentStatus()?.isRightInEar == false
+            ) {
+                Log.d(TAG, "Both AirPods are out of ear, not taking over audio")
+                return
+            }
         }
 
-        val shouldTakeOverPState = when (takingOverFor) {
-            "music" -> config.takeoverWhenMediaStart
-            "call" -> config.takeoverWhenRingingCall
-            else -> false
-        }
-
-        if (!shouldTakeOverPState) {
-            Log.d(TAG, "Not taking over audio, phone state takeover disabled")
-            return
-        }
-
-        val shouldTakeOver = when (bleManager.getMostRecentStatus()?.connectionState) {
-            "Disconnected" -> config.takeoverWhenDisconnected
-            "Idle" -> config.takeoverWhenIdle
-            "Music" -> config.takeoverWhenMusic
-            "Call" -> config.takeoverWhenCall
-            "Ringing" -> config.takeoverWhenCall
-            "Hanging Up" -> config.takeoverWhenCall
-            else -> false
-        }
-
-        if (!shouldTakeOver) {
-            Log.d(TAG, "Not taking over audio, airpods state takeover disabled")
+        if (!isTakeOverAllowedByPrefs(takingOverFor)) {
             return
         }
 
@@ -2881,6 +3275,22 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
                 CoroutineScope(Dispatchers.IO).launch {
                     connectToSocket(bluetoothAdapter, device!!)
                     connectAudio(this@AirPodsService, device)
+                    if (takingOverFor == "call") {
+                        // After AACP is up, claim ownership + stem capture for answer-on-stem.
+                        delay(800)
+                        if (BluetoothConnectionManager.aacpSocket?.isConnected == true) {
+                            val owns = aacpManager.getControlCommandStatus(
+                                AACPManager.Companion.ControlCommandIdentifiers.OWNS_CONNECTION
+                            )?.value?.getOrNull(0)?.toInt()
+                            markReleaseOwnershipAfterCallIfNeeded(owns)
+                            aacpManager.sendControlCommand(
+                                AACPManager.Companion.ControlCommandIdentifiers.OWNS_CONNECTION.value,
+                                1
+                            )
+                            enableStemCaptureForIncomingCall()
+                            maybeStartHeadGesturesAfterCallTakeOver()
+                        }
+                    }
                 }
 //                isConnectedLocally = true
             }
@@ -2896,6 +3306,63 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
         )
 
 //        CrossDevice.isAvailable = false
+    }
+
+    /** Remember to hand the link back after the call if we weren't already the owner. */
+    private fun markReleaseOwnershipAfterCallIfNeeded(ownsBefore: Int?) {
+        if (ownsBefore != 1 || otherDeviceIsAudioSource()) {
+            releaseOwnershipAfterCall = true
+        }
+    }
+
+    /** Route stem single-press to this phone while ringing (otherwise Mac may get the gesture). */
+    private fun enableStemCaptureForIncomingCall() {
+        if (BluetoothConnectionManager.aacpSocket?.isConnected != true) return
+        val ownsBefore = aacpManager.getControlCommandStatus(
+            AACPManager.Companion.ControlCommandIdentifiers.OWNS_CONNECTION
+        )?.value?.getOrNull(0)?.toInt()
+        // takeOver may have already claimed OWNS=1; mark only if still not our link.
+        markReleaseOwnershipAfterCallIfNeeded(ownsBefore)
+        stemCustomizedForCall = true
+        Log.d(
+            TAG,
+            "Enabling stem capture for incoming call (customize single press, ownsBefore=$ownsBefore, releaseAfter=$releaseOwnershipAfterCall)"
+        )
+        aacpManager.sendStemConfigPacket(
+            singlePressCustomized = true,
+            doublePressCustomized = false,
+            triplePressCustomized = false,
+            longPressCustomized = false,
+        )
+        // Ensure we own the link so AirPods deliver the press here.
+        aacpManager.sendControlCommand(
+            AACPManager.Companion.ControlCommandIdentifiers.OWNS_CONNECTION.value, 1
+        )
+    }
+
+    /**
+     * @param releaseOwnership When true (call ended), restore stem config and give the link
+     * back to Mac/previous owner if we had claimed it for the call.
+     */
+    private fun restoreStemConfigAfterCall(releaseOwnership: Boolean) {
+        if (!stemCustomizedForCall && !(releaseOwnership && releaseOwnershipAfterCall)) return
+        if (stemCustomizedForCall) {
+            stemCustomizedForCall = false
+            if (BluetoothConnectionManager.aacpSocket?.isConnected == true) {
+                Log.d(TAG, "Restoring normal stem config after call")
+                setupStemActions()
+            }
+        }
+        if (!releaseOwnership || !releaseOwnershipAfterCall) return
+        releaseOwnershipAfterCall = false
+        if (BluetoothConnectionManager.aacpSocket?.isConnected != true) return
+        Log.d(TAG, "Releasing ownership after call — stem gestures back to previous device")
+        aacpManager.sendControlCommand(
+            AACPManager.Companion.ControlCommandIdentifiers.OWNS_CONNECTION.value,
+            byteArrayOf(0x00)
+        )
+        otherDeviceTookOver = true
+        disconnectAudio(this, device)
     }
 
     @SuppressLint("MissingPermission", "UnspecifiedRegisterReceiverFlag")
@@ -3092,13 +3559,18 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
                     aacpManager.sendSomePacketIDontKnowWhatItIs()
                     delay(200)
                     aacpManager.sendRequestProximityKeys((AACPManager.Companion.ProximityKeyType.IRK.value + AACPManager.Companion.ProximityKeyType.ENC_KEY.value).toByte())
-                    if (!handleIncomingCallOnceConnected) startHeadTracking() else handleIncomingCall()
+                    // Head tracking stays dormant on connect — only arm for ringing gestures.
+                    if (handleIncomingCallOnceConnected || (isRinging && config.headGestures)) {
+                        Handler(Looper.getMainLooper()).post {
+                            handleIncomingCall()
+                        }
+                    }
                     Handler(Looper.getMainLooper()).postDelayed({
+                        if (BluetoothConnectionManager.aacpSocket?.isConnected != true) return@postDelayed
                         aacpManager.sendPacket(aacpManager.createHandshakePacket())
                         aacpManager.sendSetFeatureFlagsPacket()
                         aacpManager.sendNotificationRequest()
                         aacpManager.sendRequestProximityKeys(AACPManager.Companion.ProximityKeyType.IRK.value)
-                        if (!handleIncomingCallOnceConnected) stopHeadTracking()
                     }, 5000)
 
                     sendBroadcast(
@@ -3108,6 +3580,17 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
                             })
 
                     setupStemActions()
+
+                    // One gentle retry if listening mode wasn't in the first notification burst.
+                    CoroutineScope(Dispatchers.IO).launch {
+                        delay(2000)
+                        if (BluetoothConnectionManager.aacpSocket?.isConnected == true &&
+                            !aacpManager.hasListeningModeStatus()
+                        ) {
+                            Log.d(TAG, "Listening mode missing after connect — re-requesting notifications")
+                            aacpManager.sendNotificationRequest()
+                        }
+                    }
 
                     while (socket.isConnected) {
                         try {
@@ -3294,7 +3777,22 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
 //        if (!isConnectedLocally && CrossDevice.isAvailable) {
 //            ancNotification.setStatus(CrossDevice.ancBytes)
 //        }
+        // Until AirPods push LISTENING_MODE this session, prefer last synced value so the UI
+        // doesn't fall back to default Off → Transparency.
+        if (!aacpManager.hasListeningModeStatus()) {
+            val last = sharedPreferences.getInt("last_listening_mode", 0)
+            if (last in 1..4) return last
+        }
         return ancNotification.status
+    }
+
+    /** True when AACP reports media/call audio owned by another paired device (e.g. Mac). */
+    private fun otherDeviceIsAudioSource(): Boolean {
+        val src = aacpManager.audioSource ?: return false
+        if (localMac.isEmpty()) return false
+        return src.type != AACPManager.Companion.AudioSourceType.NONE &&
+            src.mac != null &&
+            src.mac != localMac
     }
 
     fun disconnectAudio(context: Context, device: BluetoothDevice?) {
@@ -3479,6 +3977,7 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
         } catch (e: Exception) {
             e.printStackTrace()
         }
+        unregisterPhoneBatteryReceiverIfNeeded()
         try {
             bleManager.stopScanning()
         } catch (e: Exception) {
@@ -3493,15 +3992,23 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
     }
 
     var isHeadTrackingActive = false
+    /** Count of validated motion samples (0x44/0x45) since last startHeadTracking. */
+    @Volatile private var validHeadTrackingSamples = 0
+    private var lastHtSampleLogMs = 0L
 
     /**
      * @param allowOwnershipClaim If true, may claim OWNS_CONNECTION / takeOver so HT
-     * works during calls/gestures. Must stay false for the post-connect probe — soft-claim
-     * kicks Mac/other devices onto their speakers without this phone taking A2DP.
+     * works for ringing gestures / Head Tracking screen. Must stay false for any
+     * automatic background probe — soft-claim kicks Mac/other devices onto speakers.
      */
     fun startHeadTracking(allowOwnershipClaim: Boolean = false) {
+        if (BluetoothConnectionManager.aacpSocket?.isConnected != true) {
+            Log.d(TAG, "Skipping startHeadTracking — AACP not connected")
+            return
+        }
         isHeadTrackingActive = true
-        val useAlternatePackets =
+        validHeadTrackingSamples = 0
+        val preferAlternate =
             sharedPreferences.getBoolean("use_alternate_head_tracking_packets", true)
         val ownsConnection = aacpManager.getControlCommandStatus(
             AACPManager.Companion.ControlCommandIdentifiers.OWNS_CONNECTION
@@ -3512,7 +4019,7 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
             ownsConnection != 1
         ) {
             // Full hijack only when another device owns the link and we actually need HT
-            // for a call/gesture — never from the automatic connect handshake.
+            // for a call/gesture — never from automatic connect.
             when {
                 ownsConnection == 0 -> {
                     CoroutineScope(Dispatchers.IO).launch {
@@ -3538,28 +4045,63 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
         } else if (!allowOwnershipClaim && ownsConnection != 1) {
             Log.d(
                 TAG,
-                "Head-tracking probe without ownership claim (owns=$ownsConnection) — leave Mac/other device alone"
+                "Head-tracking without ownership claim (owns=$ownsConnection) — leave Mac/other device alone"
             )
         }
-        fun sendStartPackets() {
-            if (useAlternatePackets) {
+        fun sendStartPackets(useAlternate: Boolean) {
+            Log.d(TAG, "Sending HT start (alternate=$useAlternate)")
+            if (useAlternate) {
                 aacpManager.sendDataPacket(aacpManager.createAlternateStartHeadTrackingPacket())
             } else {
                 aacpManager.sendStartHeadTracking()
             }
         }
+        fun armStartWithFallback() {
+            sendStartPackets(preferAlternate)
+            // If no real 0x44/0x45 motion samples arrive, try the other start packet.
+            CoroutineScope(Dispatchers.IO).launch {
+                delay(1500)
+                if (!isHeadTrackingActive) return@launch
+                if (validHeadTrackingSamples > 0) {
+                    Log.d(TAG, "HT stream OK ($validHeadTrackingSamples samples)")
+                    return@launch
+                }
+                Log.w(TAG, "No HT motion samples after 1.5s — trying other start packet")
+                sendStartPackets(!preferAlternate)
+                delay(1500)
+                if (!isHeadTrackingActive) return@launch
+                if (validHeadTrackingSamples == 0) {
+                    Log.w(TAG, "Still no HT motion samples — gestures will stay dormant")
+                } else {
+                    Log.d(TAG, "HT stream recovered ($validHeadTrackingSamples samples)")
+                }
+            }
+        }
         if (delayStartPackets) {
             CoroutineScope(Dispatchers.IO).launch {
                 delay(300)
-                if (isHeadTrackingActive) sendStartPackets()
+                // Abort if call was answered/ended (or HT stopped) while waiting.
+                if (!isHeadTrackingActive) return@launch
+                if (allowOwnershipClaim && !isRinging && isInCall) {
+                    Log.d(TAG, "Skipping delayed HT start — already in call")
+                    stopHeadGesturesForCall()
+                    return@launch
+                }
+                armStartWithFallback()
             }
         } else {
-            sendStartPackets()
+            armStartWithFallback()
         }
         HeadTracking.reset()
     }
 
     fun stopHeadTracking() {
+        val wasActive = isHeadTrackingActive
+        isHeadTrackingActive = false
+        // doNotStop=true: detector stops its loop without calling back into stopHeadTracking.
+        gestureDetector?.stopDetection(doNotStop = true)
+        if (!wasActive) return
+        if (BluetoothConnectionManager.aacpSocket?.isConnected != true) return
         val useAlternatePackets =
             sharedPreferences.getBoolean("use_alternate_head_tracking_packets", true)
         if (useAlternatePackets) {
@@ -3567,8 +4109,6 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
         } else {
             aacpManager.sendStopHeadTracking()
         }
-        isHeadTrackingActive = false
-        gestureDetector?.stopDetection()
     }
 
     @SuppressLint("MissingPermission")

@@ -95,15 +95,18 @@ class AppListenerService: AccessibilityService() {
             if (ev?.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
                 val pkg = ev.packageName?.toString() ?: return
                 if (pkg == "com.android.systemui") return // after camera opens, systemui is opened, probably for the privacy indicators
+                val airPodsService = ServiceManager.getService()
+                // Don't poke stem config / AACP while BT is parked.
+                if (airPodsService?.bluetoothOffStandby == true) return
                 Log.d(TAG, "Package: $pkg, cameraOpen: $cameraOpen")
                 if (isCameraPackage(pkg)) {
                     Log.d(TAG, "Camera app opened: $pkg")
                     if (!cameraOpen) cameraOpen = true
-                    ServiceManager.getService()?.cameraOpened()
+                    airPodsService?.cameraOpened()
                 } else {
                     if (cameraOpen) {
                         cameraOpen = false
-                        ServiceManager.getService()?.cameraClosed()
+                        airPodsService?.cameraClosed()
                     } else {
                         Log.d(TAG, "ignoring")
                     }

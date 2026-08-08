@@ -126,7 +126,9 @@ fun NoiseControlSettings(
                 )
             }
 
-            val selectedMode = NoiseControlMode.entries[(noiseControlModeValue - 1).coerceIn(0, NoiseControlMode.entries.lastIndex)]
+            val selectedMode = noiseControlModeValue.takeIf { it in 1..4 }?.let {
+                NoiseControlMode.entries[it - 1]
+            }
 
             Column {
                 Box(
@@ -239,10 +241,13 @@ fun NoiseControlSettings(
             }
 
 
-            val index = (noiseControlModeValue - 1).coerceIn(0, NoiseControlMode.entries.size - 1)
-            noiseControlMode.value = NoiseControlMode.entries[index]
-
-            onModeSelected(noiseControlMode.value, received = true)
+            // Only apply a real synced value (1–4). Unsynced 0 used to coerce to OFF, which
+            // then remapped to Transparency when Off mode is disabled — the wrong default.
+            if (noiseControlModeValue in 1..4) {
+                val index = noiseControlModeValue - 1
+                noiseControlMode.value = NoiseControlMode.entries[index]
+                onModeSelected(noiseControlMode.value, received = true)
+            }
 
             Box(
                 modifier = Modifier

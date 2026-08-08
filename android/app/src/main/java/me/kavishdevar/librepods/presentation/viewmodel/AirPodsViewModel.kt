@@ -32,6 +32,7 @@ import androidx.core.content.edit
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.update
@@ -71,7 +72,8 @@ data class AirPodsUiState(
     val offListeningMode: Boolean = true,
 
     val battery: List<Battery> = emptyList(),
-    val ancMode: Int = 3,
+    /** 1=Off, 2=ANC, 3=Transparency, 4=Adaptive. 0 = not synced yet. */
+    val ancMode: Int = 0,
 
     val modelName: String = "",
     val actualModel: String = "",
@@ -132,7 +134,7 @@ val demoState = AirPodsUiState(
         Battery(BatteryComponent.CASE, 76, BatteryStatus.NOT_CHARGING)
     ),
 
-    ancMode = 3,
+    ancMode = 4,
     offListeningMode = false,
 
     modelName = demoInstance.model.displayName,
@@ -330,6 +332,20 @@ class AirPodsViewModel(
                         _uiState.update {
                             it.copy(isLocallyConnected = true, isNearby = true)
                         }
+                        // Status packets arrive shortly after handshake — refresh once connected
+                        // and again after a short delay so LISTENING_MODE can sync.
+                        loadCurrentStatus()
+                        viewModelScope.launch {
+                            delay(1500)
+                            loadCurrentStatus()
+                        }
+                    }
+
+                    AirPodsNotifications.ANC_DATA -> {
+                        val mode = intent.getIntExtra("data", 0)
+                        if (mode in 1..4) {
+                            applyListeningMode(mode)
+                        }
                     }
 
                     AirPodsNotifications.AIRPODS_DISCONNECTED -> {
@@ -390,6 +406,7 @@ class AirPodsViewModel(
             addAction(AirPodsNotifications.AIRPODS_NEARBY)
             addAction(AirPodsNotifications.AIRPODS_GONE)
             addAction(AirPodsNotifications.BATTERY_DATA)
+            addAction(AirPodsNotifications.ANC_DATA)
             addAction(AirPodsNotifications.EQ_DATA)
             addAction(AirPodsNotifications.AIRPODS_INFORMATION_UPDATED)
         }
@@ -422,6 +439,9 @@ class AirPodsViewModel(
         identifier: ControlCommandIdentifiers, value: Int
     ) {
         setControlCommandValue(identifier, byteArrayOf(value.toByte()))
+        if (identifier == ControlCommandIdentifiers.LISTENING_MODE && value in 1..4) {
+            applyListeningMode(value)
+        }
     }
 
     fun setControlCommandByte(
@@ -432,6 +452,11 @@ class AirPodsViewModel(
 
     fun observeControl(identifier: ControlCommandIdentifiers) {
         val listener = controlRepo.observe(identifier) { value ->
+            if (identifier == ControlCommandIdentifiers.LISTENING_MODE) {
+                val mode = value.getOrNull(0)?.toInt() ?: return@observe
+                if (mode in 1..4) applyListeningMode(mode)
+                return@observe
+            }
             _uiState.update { state ->
                 val current = state.controlStates[identifier]
                 if (current?.contentEquals(value) == true) return@update state
@@ -450,6 +475,24 @@ class AirPodsViewModel(
         }
 
         listeners[identifier] = listener
+    }
+
+    private fun applyListeningMode(mode: Int) {
+        if (mode !in 1..4) return
+        sharedPreferences.edit { putInt("last_listening_mode", mode) }
+        val modeBytes = byteArrayOf(mode.toByte())
+        _uiState.update { state ->
+            if (state.ancMode == mode &&
+                state.controlStates[ControlCommandIdentifiers.LISTENING_MODE]
+                    ?.contentEquals(modeBytes) == true
+            ) {
+                return@update state
+            }
+            state.copy(
+                ancMode = mode,
+                controlStates = state.controlStates + (ControlCommandIdentifiers.LISTENING_MODE to modeBytes)
+            )
+        }
     }
 
     // I'm lazy, sorry.
@@ -495,13 +538,26 @@ class AirPodsViewModel(
         if (isDemoMode) return
         service.let { service ->
             val aacpUp = BluetoothConnectionManager.aacpSocket?.isConnected == true
-            _uiState.update {
-                it.copy(
+            val liveMode = controlRepo.getValue(ControlCommandIdentifiers.LISTENING_MODE)
+                ?.getOrNull(0)?.toInt()?.takeIf { it in 1..4 }
+                ?: service.getANC().takeIf { it in 1..4 }
+            val persistedMode = sharedPreferences.getInt("last_listening_mode", 0)
+                .takeIf { it in 1..4 }
+            val mode = liveMode ?: persistedMode ?: 0
+            val repoMap = controlRepo.getMap()
+            _uiState.update { state ->
+                val mergedControls = state.controlStates + repoMap
+                val withMode = if (mode in 1..4) {
+                    mergedControls + (ControlCommandIdentifiers.LISTENING_MODE to byteArrayOf(mode.toByte()))
+                } else {
+                    mergedControls
+                }
+                state.copy(
                     isLocallyConnected = aacpUp,
                     isNearby = aacpUp || service.bleManager.hasNearbyDevices(),
                     battery = service.getBattery(),
-                    ancMode = controlRepo.getValue(ControlCommandIdentifiers.LISTENING_MODE)?.get(0)?.toInt() ?: 1,
-                    controlStates = controlRepo.getMap()
+                    ancMode = mode,
+                    controlStates = withMode
                 )
             }
         }
