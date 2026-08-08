@@ -8,6 +8,7 @@ on:
       - 'android/**'
       - 'root-module-manual/**'
       - '.github/workflows/ci-android.yml'
+      - '.github/scripts/bump-android-version.sh'
   pull_request:
     paths:
       - 'android/**'
@@ -22,15 +23,59 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     outputs:
       short_sha: ${{ steps.vars.outputs.short_sha }}
       app_version: ${{ steps.version.outputs.app_version }}
+      version_code: ${{ steps.version.outputs.version_code }}
+      release_tag: ${{ steps.version.outputs.release_tag }}
+      branch: ${{ steps.version.outputs.branch }}
       has_release_keystore: ${{ steps.keystore.outputs.available }}
+      should_release: ${{ steps.version.outputs.should_release }}
     steps:
+      - name: Resolve branch
+        id: meta
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            BRANCH="${{ github.event.inputs.branch }}"
+          else
+            BRANCH="${{ github.ref_name }}"
+          fi
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          if [[ "$BRANCH" == personal/* ]] && [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/checkout@v4
         with:
           submodules: true
-          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.branch || github.ref }}
+          ref: ${{ steps.meta.outputs.branch }}
+          fetch-depth: 0
+          # Needed so the version-bump commit can be pushed back to personal/**
+          token: ${{ secrets.GITHUB_TOKEN }}
+          persist-credentials: true
+
+      - name: Bump Android version
+        id: bump
+        if: steps.meta.outputs.should_release == 'true'
+        run: bash .github/scripts/bump-android-version.sh android/app/build.gradle.kts
+
+      - name: Commit version bump
+        if: steps.meta.outputs.should_release == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add android/app/build.gradle.kts
+          if git diff --cached --quiet; then
+            echo "No version changes to commit"
+          else
+            git commit -m "chore(android): bump version to ${{ steps.bump.outputs.app_version }} [skip ci]"
+            git push origin "HEAD:${{ steps.meta.outputs.branch }}"
+          fi
+
       - uses: actions/setup-java@v4
         with:
           distribution: zulu
@@ -72,11 +117,28 @@ jobs:
         if: github.event_name != 'pull_request'
         run: ./gradlew packageReleaseArtifacts
         working-directory: android
-      - name: Get app version
+
+      - name: Resolve app version outputs
         id: version
-        run: echo "app_version=$(grep 'appVersionName =' android/app/build.gradle.kts | sed 's/.*= "\(.*\)"/\1/')" >> $GITHUB_OUTPUT
+        run: |
+          if [ -n "${{ steps.bump.outputs.app_version }}" ]; then
+            APP_VERSION="${{ steps.bump.outputs.app_version }}"
+            VERSION_CODE="${{ steps.bump.outputs.version_code }}"
+          else
+            APP_VERSION=$(grep -E '^[[:space:]]*val appVersionName[[:space:]]*=' android/app/build.gradle.kts | sed -E 's/.*"([^"]+)".*/\1/')
+            VERSION_CODE=$(grep -E '^[[:space:]]*versionCode[[:space:]]*=' android/app/build.gradle.kts | head -1 | sed -E 's/.*versionCode[[:space:]]*=[[:space:]]*([0-9]+).*/\1/')
+          fi
+          {
+            echo "app_version=${APP_VERSION}"
+            echo "version_code=${VERSION_CODE}"
+            echo "release_tag=v${APP_VERSION}-personal"
+            echo "branch=${{ steps.meta.outputs.branch }}"
+            echo "should_release=${{ steps.meta.outputs.should_release }}"
+          } >> "$GITHUB_OUTPUT"
+
       - id: vars
-        run: echo "short_sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+        run: echo "short_sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
       - uses: actions/upload-artifact@v4
         if: github.event_name != 'pull_request'
         with:
@@ -117,7 +179,7 @@ jobs:
           if-no-files-found: ignore
 
   release:
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    if: needs.build.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     needs: build
     permissions:
@@ -128,6 +190,8 @@ jobs:
         with:
           fetch-depth: 0
           fetch-tags: true
+          ref: ${{ needs.build.outputs.branch }}
+
       - uses: actions/download-artifact@v4
         with:
           name: apk-release
@@ -149,32 +213,30 @@ jobs:
         with:
           name: root-module-debug
           path: artifacts/root-module-debug
+
       - id: prev
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG=$(gh release list \
-            --limit 1 \
+            --limit 20 \
             --json tagName \
-            --jq '.[0].tagName // empty')
+            --jq '[.[] | select(.tagName | test("^v.+-personal$"))][0].tagName // empty')
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
-          echo "tag=$TAG" >> $GITHUB_OUTPUT
       - id: changelog
         run: |
           REPO="${{ github.server_url }}/${{ github.repository }}"
           if [ -z "${{ steps.prev.outputs.tag }}" ]; then
-            NOTES=$(git log --pretty=format:"- %s ([%h]($REPO/commit/%H))")
+            NOTES=$(git log --pretty=format:"- %s ([%h]($REPO/commit/%H))" -50)
           else
-            NOTES=$(git log ${{ steps.prev.outputs.tag }}..HEAD --pretty=format:"- %s ([%h]($REPO/commit/%H))" || git log --pretty=format:"- %s ([%h]($REPO/commit/%H))")
+            NOTES=$(git log ${{ steps.prev.outputs.tag }}..HEAD --pretty=format:"- %s ([%h]($REPO/commit/%H))" || git log --pretty=format:"- %s ([%h]($REPO/commit/%H))" -50)
           fi
           {
             echo "notes<<EOF"
             echo "$NOTES"
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
-
-      - id: tag
-        run: echo "tag=nightly-${{ needs.build.outputs.short_sha }}" >> $GITHUB_OUTPUT
 
       - env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -185,15 +247,21 @@ jobs:
             echo "No release assets found"
             exit 1
           fi
-          gh release delete "${{ steps.tag.outputs.tag }}" --yes || true
-          gh release create "${{ steps.tag.outputs.tag }}" \
+          TAG="${{ needs.build.outputs.release_tag }}"
+          TITLE="LibrePods FOSS v${{ needs.build.outputs.app_version }} (personal)"
+          gh release delete "$TAG" --yes || true
+          git push origin ":refs/tags/$TAG" 2>/dev/null || true
+          gh release create "$TAG" \
             "${ASSETS[@]}" \
-            -t "Nightly ${{ needs.build.outputs.short_sha }}" \
+            -t "$TITLE" \
             --notes "${{ steps.changelog.outputs.notes }}" \
-            --prerelease
+            --latest \
+            --target "${{ needs.build.outputs.branch }}"
+
       - name: Get timestamp
         id: timestamp
-        run: echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_OUTPUT
+        run: echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
       - name: Post to Discord
         env:
           DISCORD_ANDROID_CI_URL: ${{ secrets.DISCORD_ANDROID_CI_URL }}
@@ -204,8 +272,8 @@ jobs:
             -d '{
               "embeds": [
                 {
-                  "title": "LibrePods Nightly Build",
-                  "description": "Download the latest debug and release APKs.",
+                  "title": "LibrePods Personal Build v${{ needs.build.outputs.app_version }}",
+                  "description": "versionCode ${{ needs.build.outputs.version_code }} — download the latest debug and release APKs.",
                   "color": 253060,
                   "fields": [
                     {
@@ -228,13 +296,13 @@ jobs:
                       "type": 2,
                       "label": "Download Release APK",
                       "style": 5,
-                      "url": "${{ github.server_url }}/${{ github.repository }}/releases/download/nightly-${{ needs.build.outputs.short_sha }}/LibrePods-FOSS-v${{ needs.build.outputs.app_version }}-release.apk"
+                      "url": "${{ github.server_url }}/${{ github.repository }}/releases/download/${{ needs.build.outputs.release_tag }}/LibrePods-FOSS-v${{ needs.build.outputs.app_version }}-release.apk"
                     },
                     {
                       "type": 2,
                       "label": "Download Debug APK",
                       "style": 5,
-                      "url": "${{ github.server_url }}/${{ github.repository }}/releases/download/nightly-${{ needs.build.outputs.short_sha }}/LibrePods-FOSS-v${{ needs.build.outputs.app_version }}-debug.apk"
+                      "url": "${{ github.server_url }}/${{ github.repository }}/releases/download/${{ needs.build.outputs.release_tag }}/LibrePods-FOSS-v${{ needs.build.outputs.app_version }}-debug.apk"
                     }
                   ]
                 }
