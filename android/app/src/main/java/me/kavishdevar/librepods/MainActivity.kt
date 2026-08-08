@@ -60,8 +60,8 @@ import me.kavishdevar.librepods.utils.XposedState
 import kotlin.io.encoding.ExperimentalEncodingApi
 
 lateinit var serviceConnection: ServiceConnection
-lateinit var connectionStatusReceiver: BroadcastReceiver
-lateinit var testReviewReceiver: BroadcastReceiver
+var connectionStatusReceiver: BroadcastReceiver? = null
+var testReviewReceiver: BroadcastReceiver? = null
 
 //@AndroidEntryPoint
 @ExperimentalMaterial3Api
@@ -108,36 +108,33 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun cleanupBindings() {
+        if (::serviceConnection.isInitialized) {
+            try {
+                unbindService(serviceConnection)
+                Log.d("MainActivity", "Unbound service")
+            } catch (e: Exception) {
+                Log.e("MainActivity", "Error while unbinding service: $e")
+            }
+        }
+        connectionStatusReceiver?.let { receiver ->
+            try {
+                unregisterReceiver(receiver)
+                Log.d("MainActivity", "Unregistered receiver")
+            } catch (e: Exception) {
+                Log.e("MainActivity", "Error while unregistering receiver: $e")
+            }
+        }
+    }
+
     override fun onDestroy() {
-        try {
-            unbindService(serviceConnection)
-            Log.d("MainActivity", "Unbound service")
-        } catch (e: Exception) {
-            Log.e("MainActivity", "Error while unbinding service: $e")
-        }
-        try {
-            unregisterReceiver(connectionStatusReceiver)
-            Log.d("MainActivity", "Unregistered receiver")
-        } catch (e: Exception) {
-            Log.e("MainActivity", "Error while unregistering receiver: $e")
-        }
+        cleanupBindings()
         sendBroadcast(Intent(AirPodsNotifications.DISCONNECT_RECEIVERS))
         super.onDestroy()
     }
 
     override fun onStop() {
-        try {
-            unbindService(serviceConnection)
-            Log.d("MainActivity", "Unbound service")
-        } catch (e: Exception) {
-            Log.e("MainActivity", "Error while unbinding service: $e")
-        }
-        try {
-            unregisterReceiver(connectionStatusReceiver)
-            Log.d("MainActivity", "Unregistered receiver")
-        } catch (e: Exception) {
-            Log.e("MainActivity", "Error while unregistering receiver: $e")
-        }
+        cleanupBindings()
         super.onStop()
     }
 }

@@ -109,13 +109,7 @@ class IslandWindow(private val context: Context) {
     private val batteryReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action == AirPodsNotifications.BATTERY_DATA) {
-                val batteryList = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    intent.getParcelableArrayListExtra("data", Battery::class.java)
-                } else {
-                    @Suppress("DEPRECATION")
-                    intent.getParcelableArrayListExtra("data")
-                }
-                updateBatteryDisplay(batteryList)
+                updateBatteryDisplay(Battery.fromIntent(intent))
             } else if (intent?.action == AirPodsNotifications.DISCONNECT_RECEIVERS) {
                 try {
                     context?.unregisterReceiver(this)

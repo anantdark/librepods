@@ -130,6 +130,7 @@ import me.kavishdevar.librepods.utils.SystemApisUtils.METADATA_UNTETHERED_RIGHT_
 import me.kavishdevar.librepods.utils.SystemApisUtils.METADATA_UNTETHERED_RIGHT_LOW_BATTERY_THRESHOLD
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.concurrent.TimeUnit
 import kotlin.io.encoding.Base64
 import kotlin.io.encoding.ExperimentalEncodingApi
 import kotlin.time.Duration.Companion.milliseconds
@@ -248,14 +249,16 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
         ) {
             if (device.connectionState == "Disconnected" && BluetoothConnectionManager.aacpSocket?.isConnected != true) { // should never happen unless android messes up and sends us a stale broadcast
                 Log.d(TAG, "Seems no device has taken over, we will.")
-                val bluetoothManager = getSystemService(BluetoothManager::class.java)
-                val bluetoothAdapter = bluetoothManager.adapter
-                val bluetoothDevice = bluetoothAdapter.getRemoteDevice(
-                    sharedPreferences.getString(
-                        "mac_address", ""
-                    ) ?: ""
-                )
-                connectToSocket(bluetoothAdapter, bluetoothDevice)
+                CoroutineScope(Dispatchers.IO).launch {
+                    val bluetoothManager = getSystemService(BluetoothManager::class.java)
+                    val bluetoothAdapter = bluetoothManager.adapter
+                    val bluetoothDevice = bluetoothAdapter.getRemoteDevice(
+                        sharedPreferences.getString(
+                            "mac_address", ""
+                        ) ?: ""
+                    )
+                    connectToSocket(bluetoothAdapter, bluetoothDevice)
+                }
             }
             Log.d(TAG, "Device status changed")
             if (BluetoothConnectionManager.aacpSocket?.isConnected == true) return
@@ -367,6 +370,9 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
     @SuppressLint("MissingPermission", "UnspecifiedRegisterReceiverFlag", "HardwareIds")
     override fun onCreate() {
         super.onCreate()
+        // Must run before any blocking work (e.g. su). startForegroundService() ANRs otherwise.
+        startForegroundNotification()
+
         Log.i(TAG, "lib exempt worked: ${isBluetoothSocketExempted()}")
 
         sharedPreferencesLogs = getSharedPreferences("packet_logs", MODE_PRIVATE)
@@ -384,43 +390,18 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
 
         attManager = ATTManagerv2()
 
+        // Defaults before the listener so first-run stem keys don't spam setupStemActions.
+        ensureDefaultPreferences()
+        initializeConfig()
+
         sharedPreferences.registerOnSharedPreferenceChangeListener(this)
 
         localMac = config.selfMacAddress
         if (localMac.isEmpty()) {
-            if (checkSelfPermission("android.permission.LOCAL_MAC_ADDRESS") == PackageManager.PERMISSION_GRANTED) {
-                val bluetoothManager = getSystemService(BluetoothManager::class.java)
-                val bluetoothAdapter = bluetoothManager.adapter
-                localMac = bluetoothAdapter.address
-            } else {
-                localMac = try {
-                    val process = Runtime.getRuntime().exec(
-                        arrayOf("su", "-c", "settings get secure bluetooth_address")
-                    )
-
-                    val exitCode = process.waitFor()
-
-                    if (exitCode == 0) {
-                        process.inputStream.bufferedReader().use { it.readLine()?.trim().orEmpty() }
-                    } else {
-                        ""
-                    }
-                } catch (e: Exception) {
-                    Log.e(
-                        TAG,
-                        "Error retrieving local MAC address: ${e.message}. We probably aren't rooted."
-                    )
-                    ""
-                }
-            }
-            config.selfMacAddress = localMac
-            sharedPreferences.edit {
-                putString("self_mac_address", localMac)
-            }
+            resolveLocalMacAddressAsync()
         }
 
         ServiceManager.setService(this)
-        startForegroundNotification()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             initGestureDetector()
         } else {
@@ -434,102 +415,6 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
         bleManager.setAirPodsStatusListener(bleStatusListener)
 
         sharedPreferences = getSharedPreferences("settings", MODE_PRIVATE)
-
-        with(sharedPreferences) {
-            edit {
-                if (!contains("conversational_awareness_pause_music")) putBoolean(
-                    "conversational_awareness_pause_music", false
-                )
-                if (!contains("personalized_volume")) putBoolean("personalized_volume", false)
-                if (!contains("automatic_ear_detection")) putBoolean(
-                    "automatic_ear_detection", true
-                )
-                if (!contains("long_press_nc")) putBoolean("long_press_nc", true)
-                if (!contains("show_phone_battery_in_widget")) putBoolean(
-                    "show_phone_battery_in_widget", true
-                )
-                if (!contains("single_anc")) putBoolean("single_anc", true)
-                if (!contains("long_press_transparency")) putBoolean(
-                    "long_press_transparency", true
-                )
-                if (!contains("conversational_awareness")) putBoolean(
-                    "conversational_awareness", true
-                )
-                if (!contains("relative_conversational_awareness_volume")) putBoolean(
-                    "relative_conversational_awareness_volume", true
-                )
-                if (!contains("long_press_adaptive")) putBoolean("long_press_adaptive", true)
-                if (!contains("loud_sound_reduction")) putBoolean("loud_sound_reduction", true)
-                if (!contains("long_press_off")) putBoolean("long_press_off", false)
-                if (!contains("volume_control")) putBoolean("volume_control", true)
-                if (!contains("head_gestures")) putBoolean("head_gestures", true)
-                if (!contains("disconnect_when_not_wearing")) putBoolean(
-                    "disconnect_when_not_wearing", false
-                )
-
-                // AirPods state-based takeover
-                if (!contains("takeover_when_disconnected")) putBoolean(
-                    "takeover_when_disconnected", false
-                )
-                if (!contains("takeover_when_idle")) putBoolean("takeover_when_idle", false)
-                if (!contains("takeover_when_music")) putBoolean("takeover_when_music", false)
-                if (!contains("takeover_when_call")) putBoolean("takeover_when_call", false)
-
-                // Phone state-based takeover
-                if (!contains("takeover_when_ringing_call")) putBoolean(
-                    "takeover_when_ringing_call", false
-                )
-                if (!contains("takeover_when_media_start")) putBoolean(
-                    "takeover_when_media_start", false
-                )
-
-                if (!contains("adaptive_strength")) putInt("adaptive_strength", 51)
-                if (!contains("tone_volume")) putInt("tone_volume", 75)
-                if (!contains("conversational_awareness_volume")) putInt(
-                    "conversational_awareness_volume", 43
-                )
-
-                if (!contains("qs_click_behavior")) putString("qs_click_behavior", "cycle")
-                if (!contains("name")) putString("name", "AirPods")
-
-                if (!contains("left_single_press_action")) putString(
-                    "left_single_press_action",
-                    StemAction.defaultActions[StemPressType.SINGLE_PRESS]!!.name
-                )
-                if (!contains("right_single_press_action")) putString(
-                    "right_single_press_action",
-                    StemAction.defaultActions[StemPressType.SINGLE_PRESS]!!.name
-                )
-                if (!contains("left_double_press_action")) putString(
-                    "left_double_press_action",
-                    StemAction.defaultActions[StemPressType.DOUBLE_PRESS]!!.name
-                )
-                if (!contains("right_double_press_action")) putString(
-                    "right_double_press_action",
-                    StemAction.defaultActions[StemPressType.DOUBLE_PRESS]!!.name
-                )
-                if (!contains("left_triple_press_action")) putString(
-                    "left_triple_press_action",
-                    StemAction.defaultActions[StemPressType.TRIPLE_PRESS]!!.name
-                )
-                if (!contains("right_triple_press_action")) putString(
-                    "right_triple_press_action",
-                    StemAction.defaultActions[StemPressType.TRIPLE_PRESS]!!.name
-                )
-                if (!contains("left_long_press_action")) putString(
-                    "left_long_press_action",
-                    StemAction.defaultActions[StemPressType.LONG_PRESS]!!.name
-                )
-                if (!contains("right_long_press_action")) putString(
-                    "right_long_press_action",
-                    StemAction.defaultActions[StemPressType.LONG_PRESS]!!.name
-                )
-                if (!contains("camera_action")) putString("camera_action", "SINGLE_PRESS")
-
-            }
-        }
-
-        initializeConfig()
 
         externalBroadcastReceiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context?, intent: Intent?) {
@@ -602,7 +487,7 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
                         val leAvailableForAudio =
                             bleManager.getMostRecentStatus()?.isLeftInEar == true || bleManager.getMostRecentStatus()?.isRightInEar == true
 //                        if ((CrossDevice.isAvailable && !isConnectedLocally && earDetectionNotification.status.contains(0x00)) || leAvailableForAudio) CoroutineScope(Dispatchers.IO).launch {
-                        if (leAvailableForAudio) runBlocking {
+                        if (leAvailableForAudio) CoroutineScope(Dispatchers.IO).launch {
                             takeOver("call")
                         }
                         if (config.headGestures) {
@@ -812,6 +697,27 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
         setupStemActions()
     }
 
+    private fun injectCameraShutter() {
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                // KEYCODE_CAMERA (27). MIUI Camera also accepts it while in the foreground.
+                val camera = Runtime.getRuntime().exec(arrayOf("su", "-c", "input keyevent 27"))
+                val finished = camera.waitFor(2, TimeUnit.SECONDS)
+                if (!finished) {
+                    camera.destroyForcibly()
+                    Log.w(TAG, "Camera keyevent timed out")
+                } else if (camera.exitValue() != 0) {
+                    Log.w(TAG, "Camera keyevent exited ${camera.exitValue()}, trying volume shutter")
+                    Runtime.getRuntime().exec(arrayOf("su", "-c", "input keyevent 25")).waitFor(1, TimeUnit.SECONDS)
+                } else {
+                    Log.d(TAG, "Camera shutter keyevent sent")
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to inject camera shutter", e)
+            }
+        }
+    }
+
     fun isCustomAction(
         action: StemAction?, default: StemAction?
     ): Boolean {
@@ -860,7 +766,7 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
             override fun onBatteryInfoReceived(batteryInfo: ByteArray) {
                 batteryNotification.setBattery(batteryInfo)
                 sendBroadcast(Intent(AirPodsNotifications.BATTERY_DATA).apply {
-                    putParcelableArrayListExtra("data", ArrayList(batteryNotification.getBattery()))
+                    Battery.putIntoIntent(this, batteryNotification.getBattery())
                     setPackage(packageName)
                 })
                 updateBattery()
@@ -1100,7 +1006,8 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
                     "Stem press received: $stemPressType on $bud, cameraActive: $cameraActive, cameraAction: ${config.cameraAction}"
                 )
                 if (cameraActive && config.cameraAction != null && stemPressType == config.cameraAction) {
-                        Runtime.getRuntime().exec(arrayOf("su", "-c", "input keyevent 27"))
+                    Log.d(TAG, "Camera stem action matched, injecting shutter")
+                    injectCameraShutter()
                 } else {
                     val action = getActionFor(bud, stemPressType)
                     Log.d("AirPodsParser", "$bud $stemPressType action: $action")
@@ -1350,6 +1257,157 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
             registerReceiver(a2dpConnectionStateReceiver, a2dpIntentFilter, RECEIVER_EXPORTED)
         } else {
             registerReceiver(a2dpConnectionStateReceiver, a2dpIntentFilter)
+        }
+    }
+
+    private fun ensureDefaultPreferences() {
+        with(sharedPreferences) {
+            edit {
+                if (!contains("conversational_awareness_pause_music")) putBoolean(
+                    "conversational_awareness_pause_music", false
+                )
+                if (!contains("personalized_volume")) putBoolean("personalized_volume", false)
+                if (!contains("automatic_ear_detection")) putBoolean(
+                    "automatic_ear_detection", true
+                )
+                if (!contains("long_press_nc")) putBoolean("long_press_nc", true)
+                if (!contains("show_phone_battery_in_widget")) putBoolean(
+                    "show_phone_battery_in_widget", true
+                )
+                if (!contains("single_anc")) putBoolean("single_anc", true)
+                if (!contains("long_press_transparency")) putBoolean(
+                    "long_press_transparency", true
+                )
+                if (!contains("conversational_awareness")) putBoolean(
+                    "conversational_awareness", true
+                )
+                if (!contains("relative_conversational_awareness_volume")) putBoolean(
+                    "relative_conversational_awareness_volume", true
+                )
+                if (!contains("long_press_adaptive")) putBoolean("long_press_adaptive", true)
+                if (!contains("loud_sound_reduction")) putBoolean("loud_sound_reduction", true)
+                if (!contains("long_press_off")) putBoolean("long_press_off", false)
+                if (!contains("volume_control")) putBoolean("volume_control", true)
+                if (!contains("head_gestures")) putBoolean("head_gestures", true)
+                if (!contains("disconnect_when_not_wearing")) putBoolean(
+                    "disconnect_when_not_wearing", false
+                )
+
+                // AirPods state-based takeover
+                if (!contains("takeover_when_disconnected")) putBoolean(
+                    "takeover_when_disconnected", false
+                )
+                if (!contains("takeover_when_idle")) putBoolean("takeover_when_idle", false)
+                if (!contains("takeover_when_music")) putBoolean("takeover_when_music", false)
+                if (!contains("takeover_when_call")) putBoolean("takeover_when_call", false)
+
+                // Phone state-based takeover
+                if (!contains("takeover_when_ringing_call")) putBoolean(
+                    "takeover_when_ringing_call", false
+                )
+                if (!contains("takeover_when_media_start")) putBoolean(
+                    "takeover_when_media_start", false
+                )
+
+                if (!contains("adaptive_strength")) putInt("adaptive_strength", 51)
+                if (!contains("tone_volume")) putInt("tone_volume", 75)
+                if (!contains("conversational_awareness_volume")) putInt(
+                    "conversational_awareness_volume", 43
+                )
+
+                if (!contains("qs_click_behavior")) putString("qs_click_behavior", "cycle")
+                if (!contains("name")) putString("name", "AirPods")
+
+                if (!contains("left_single_press_action")) putString(
+                    "left_single_press_action",
+                    StemAction.defaultActions[StemPressType.SINGLE_PRESS]!!.name
+                )
+                if (!contains("right_single_press_action")) putString(
+                    "right_single_press_action",
+                    StemAction.defaultActions[StemPressType.SINGLE_PRESS]!!.name
+                )
+                if (!contains("left_double_press_action")) putString(
+                    "left_double_press_action",
+                    StemAction.defaultActions[StemPressType.DOUBLE_PRESS]!!.name
+                )
+                if (!contains("right_double_press_action")) putString(
+                    "right_double_press_action",
+                    StemAction.defaultActions[StemPressType.DOUBLE_PRESS]!!.name
+                )
+                if (!contains("left_triple_press_action")) putString(
+                    "left_triple_press_action",
+                    StemAction.defaultActions[StemPressType.TRIPLE_PRESS]!!.name
+                )
+                if (!contains("right_triple_press_action")) putString(
+                    "right_triple_press_action",
+                    StemAction.defaultActions[StemPressType.TRIPLE_PRESS]!!.name
+                )
+                if (!contains("left_long_press_action")) putString(
+                    "left_long_press_action",
+                    StemAction.defaultActions[StemPressType.LONG_PRESS]!!.name
+                )
+                if (!contains("right_long_press_action")) putString(
+                    "right_long_press_action",
+                    StemAction.defaultActions[StemPressType.LONG_PRESS]!!.name
+                )
+                if (!contains("camera_action")) putString("camera_action", "SINGLE_PRESS")
+            }
+        }
+    }
+
+    private fun resolveLocalMacAddressAsync() {
+        CoroutineScope(Dispatchers.IO).launch {
+            val mac = resolveLocalMacAddress()
+            if (mac.isEmpty()) return@launch
+            localMac = mac
+            config.selfMacAddress = mac
+            sharedPreferences.edit {
+                putString("self_mac_address", mac)
+            }
+            Log.d(TAG, "Resolved local MAC address")
+        }
+    }
+
+    @SuppressLint("HardwareIds", "MissingPermission")
+    private fun resolveLocalMacAddress(): String {
+        if (checkSelfPermission("android.permission.LOCAL_MAC_ADDRESS") == PackageManager.PERMISSION_GRANTED) {
+            val address = getSystemService(BluetoothManager::class.java).adapter?.address
+            if (!address.isNullOrBlank() && !address.startsWith("02:00:00:00:00:00")) {
+                return address
+            }
+        }
+
+        try {
+            val fromSettings = Settings.Secure.getString(contentResolver, "bluetooth_address")
+            if (!fromSettings.isNullOrBlank() && fromSettings != "null") {
+                return fromSettings.trim()
+            }
+        } catch (e: Exception) {
+            Log.d(TAG, "Settings.Secure bluetooth_address unavailable: ${e.message}")
+        }
+
+        return try {
+            val process = Runtime.getRuntime().exec(
+                arrayOf("su", "-c", "settings get secure bluetooth_address")
+            )
+            val finished = process.waitFor(2, TimeUnit.SECONDS)
+            if (!finished) {
+                process.destroyForcibly()
+                Log.w(TAG, "Timed out waiting for su to read bluetooth_address")
+                return ""
+            }
+            if (process.exitValue() == 0) {
+                process.inputStream.bufferedReader().use { it.readLine()?.trim().orEmpty() }
+                    .takeUnless { it.isEmpty() || it == "null" }.orEmpty()
+            } else {
+                ""
+            }
+        } catch (e: Exception) {
+            Log.e(
+                TAG,
+                "Error retrieving local MAC address: ${e.message}. We probably aren't rooted."
+            )
+            ""
         }
     }
 
@@ -1829,7 +1887,7 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
     fun sendBatteryBroadcast() {
         broadcastBatteryInformation()
         sendBroadcast(Intent(AirPodsNotifications.BATTERY_DATA).apply {
-            putParcelableArrayListExtra("data", ArrayList(batteryNotification.getBattery()))
+            Battery.putIntoIntent(this, batteryNotification.getBattery())
             setPackage(packageName)
         })
     }
@@ -1845,50 +1903,51 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
 
     fun setBatteryMetadata() {
         if (checkSelfPermission("android.permission.BLUETOOTH_PRIVILEGED") != PackageManager.PERMISSION_GRANTED) {
-            device?.let { it ->
-                SystemApisUtils.setMetadata(
-                    it,
-                    it.METADATA_UNTETHERED_CASE_BATTERY,
-                    batteryNotification.getBattery()
-                        .find { it.component == BatteryComponent.CASE }?.level.toString()
-                        .toByteArray()
-                )
-                SystemApisUtils.setMetadata(
-                    it,
-                    it.METADATA_UNTETHERED_CASE_CHARGING,
-                    (if (batteryNotification.getBattery()
-                            .find { it.component == BatteryComponent.CASE }?.status == BatteryStatus.CHARGING
-                    ) "1".toByteArray() else "0".toByteArray())
-                )
-                SystemApisUtils.setMetadata(
-                    it,
-                    it.METADATA_UNTETHERED_LEFT_BATTERY,
-                    batteryNotification.getBattery()
-                        .find { it.component == BatteryComponent.LEFT }?.level.toString()
-                        .toByteArray()
-                )
-                SystemApisUtils.setMetadata(
-                    it,
-                    it.METADATA_UNTETHERED_LEFT_CHARGING,
-                    (if (batteryNotification.getBattery()
-                            .find { it.component == BatteryComponent.LEFT }?.status == BatteryStatus.CHARGING
-                    ) "1".toByteArray() else "0".toByteArray())
-                )
-                SystemApisUtils.setMetadata(
-                    it,
-                    it.METADATA_UNTETHERED_RIGHT_BATTERY,
-                    batteryNotification.getBattery()
-                        .find { it.component == BatteryComponent.RIGHT }?.level.toString()
-                        .toByteArray()
-                )
-                SystemApisUtils.setMetadata(
-                    it,
-                    it.METADATA_UNTETHERED_RIGHT_CHARGING,
-                    (if (batteryNotification.getBattery()
-                            .find { it.component == BatteryComponent.RIGHT }?.status == BatteryStatus.CHARGING
-                    ) "1".toByteArray() else "0".toByteArray())
-                )
-            }
+            return
+        }
+        device?.let { it ->
+            SystemApisUtils.setMetadata(
+                it,
+                it.METADATA_UNTETHERED_CASE_BATTERY,
+                batteryNotification.getBattery()
+                    .find { it.component == BatteryComponent.CASE }?.level.toString()
+                    .toByteArray()
+            )
+            SystemApisUtils.setMetadata(
+                it,
+                it.METADATA_UNTETHERED_CASE_CHARGING,
+                (if (batteryNotification.getBattery()
+                        .find { it.component == BatteryComponent.CASE }?.status == BatteryStatus.CHARGING
+                ) "1".toByteArray() else "0".toByteArray())
+            )
+            SystemApisUtils.setMetadata(
+                it,
+                it.METADATA_UNTETHERED_LEFT_BATTERY,
+                batteryNotification.getBattery()
+                    .find { it.component == BatteryComponent.LEFT }?.level.toString()
+                    .toByteArray()
+            )
+            SystemApisUtils.setMetadata(
+                it,
+                it.METADATA_UNTETHERED_LEFT_CHARGING,
+                (if (batteryNotification.getBattery()
+                        .find { it.component == BatteryComponent.LEFT }?.status == BatteryStatus.CHARGING
+                ) "1".toByteArray() else "0".toByteArray())
+            )
+            SystemApisUtils.setMetadata(
+                it,
+                it.METADATA_UNTETHERED_RIGHT_BATTERY,
+                batteryNotification.getBattery()
+                    .find { it.component == BatteryComponent.RIGHT }?.level.toString()
+                    .toByteArray()
+            )
+            SystemApisUtils.setMetadata(
+                it,
+                it.METADATA_UNTETHERED_RIGHT_CHARGING,
+                (if (batteryNotification.getBattery()
+                        .find { it.component == BatteryComponent.RIGHT }?.status == BatteryStatus.CHARGING
+                ) "1".toByteArray() else "0".toByteArray())
+            )
         }
     }
 
@@ -2443,7 +2502,9 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
             Log.d(TAG, "reconnect after reversed received, taking over")
             disconnectedBecauseReversed = false
             otherDeviceTookOver = false
-            takeOver("music", manualTakeOverAfterReversed = true)
+            CoroutineScope(Dispatchers.IO).launch {
+                takeOver("music", manualTakeOverAfterReversed = true)
+            }
         }
 
         return START_STICKY
@@ -2471,7 +2532,9 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
             )
             otherDeviceTookOver = false
         }
-        val ownsConnection = aacpManager.getControlCommandStatus(AACPManager.Companion.ControlCommandIdentifiers.OWNS_CONNECTION)?.value?.get(0)?.toInt()
+        val ownsConnection = aacpManager.getControlCommandStatus(
+            AACPManager.Companion.ControlCommandIdentifiers.OWNS_CONNECTION
+        )?.value?.getOrNull(0)?.toInt()
         Log.d(
             TAG, "owns connection: $ownsConnection"
         )
@@ -2480,7 +2543,14 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
                 Log.d(TAG, "not taking over, vendorid is probably not set to apple")
                 return
             }
-            if (aacpManager.getControlCommandStatus(AACPManager.Companion.ControlCommandIdentifiers.OWNS_CONNECTION)?.value[0]?.toInt() != 1 || (aacpManager.audioSource?.mac != localMac && aacpManager.audioSource?.type != AACPManager.Companion.AudioSourceType.NONE)) {
+            val otherDeviceIsSource =
+                aacpManager.audioSource?.mac != null &&
+                    aacpManager.audioSource?.mac != localMac &&
+                    aacpManager.audioSource?.type != AACPManager.Companion.AudioSourceType.NONE
+            // null ownership is unknown — hijacking then causes A2DP/ACL reconnect storms.
+            val needsHijack =
+                (ownsConnection != null && ownsConnection != 1) || otherDeviceIsSource
+            if (needsHijack) {
                 if (disconnectedBecauseReversed) {
                     if (manualTakeOverAfterReversed) {
                         Log.d(TAG, "forcefully taking over despite reverse as user requested")
@@ -2538,8 +2608,14 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
                 }
             } else {
                 Log.d(
-                    TAG, "Already connected locally and already own connection, skipping takeover"
+                    TAG,
+                    "Already connected locally; skipping hijack (owns=$ownsConnection, otherSource=$otherDeviceIsSource)"
                 )
+                if (startHeadTrackingAgain) {
+                    Handler(Looper.getMainLooper()).post {
+                        startHeadTracking()
+                    }
+                }
             }
             return
         }
@@ -2615,8 +2691,10 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
                 // Set a temporary connecting state
 //                isConnectedLocally = false // Keep as false since we're not actually connecting to L2CAP
             } else {
-                connectToSocket(bluetoothAdapter, device!!)
-                connectAudio(this, device)
+                CoroutineScope(Dispatchers.IO).launch {
+                    connectToSocket(bluetoothAdapter, device!!)
+                    connectAudio(this@AirPodsService, device)
+                }
 //                isConnectedLocally = true
             }
         }
@@ -2637,6 +2715,13 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
     fun connectToSocket(
         adapter: BluetoothAdapter, device: BluetoothDevice, manual: Boolean = false
     ) {
+        // socket.connect() + runBlocking must never run on the main thread (ANR).
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            CoroutineScope(Dispatchers.IO).launch {
+                connectToSocket(adapter, device, manual)
+            }
+            return
+        }
         if (BluetoothConnectionManager.aacpSocket != null && BluetoothConnectionManager.aacpSocket?.isConnected == true) return
         Log.d(TAG, "<LogCollector:Start> Connecting to socket")
         val uuid: ParcelUuid = ParcelUuid.fromString("74ec2172-0bad-4d01-8f77-997b2be0722a")
@@ -3015,42 +3100,50 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
     }
 
     fun connectAudio(context: Context, device: BluetoothDevice?) {
+        if (device == null) return
         val bluetoothAdapter = context.getSystemService(BluetoothManager::class.java).adapter
 
         bluetoothAdapter?.getProfileProxy(context, object : BluetoothProfile.ServiceListener {
             override fun onServiceConnected(profile: Int, proxy: BluetoothProfile) {
                 if (profile == BluetoothProfile.A2DP) {
-                    if (context.checkSelfPermission("android.permission.BLUETOOTH_PRIVILEGED") == PackageManager.PERMISSION_GRANTED) {
-                        try {
-                            val policyMethod = proxy.javaClass.getMethod(
-                                "setConnectionPolicy",
-                                BluetoothDevice::class.java,
-                                Int::class.java
-                            )
-                            Log.d(TAG, "calling A2DP.setConnectionPolicy for ${device?.address} to 100")
-                            policyMethod.invoke(proxy, device, 100)
+                    try {
+                        if (proxy.getConnectionState(device) == BluetoothProfile.STATE_CONNECTED) {
+                            Log.d(TAG, "A2DP already connected for ${device.address}, skip connect")
+                            return
+                        }
+                        if (context.checkSelfPermission("android.permission.BLUETOOTH_PRIVILEGED") == PackageManager.PERMISSION_GRANTED) {
+                            try {
+                                val policyMethod = proxy.javaClass.getMethod(
+                                    "setConnectionPolicy",
+                                    BluetoothDevice::class.java,
+                                    Int::class.java
+                                )
+                                Log.d(TAG, "calling A2DP.setConnectionPolicy for ${device.address} to 100")
+                                policyMethod.invoke(proxy, device, 100)
 
+                                val connectMethod =
+                                    proxy.javaClass.getMethod("connect", BluetoothDevice::class.java)
+                                connectMethod.invoke(
+                                    proxy, device
+                                )
+                            } catch (e: Exception) {
+                                e.printStackTrace()
+                            }
+                            if (MediaController.pausedWhileTakingOver) {
+                                MediaController.sendPlay()
+                            }
+                        } else {
                             val connectMethod =
                                 proxy.javaClass.getMethod("connect", BluetoothDevice::class.java)
                             connectMethod.invoke(
                                 proxy, device
                             )
-                        } catch (e: Exception) {
-                            e.printStackTrace()
-                        } finally {
-                            bluetoothAdapter.closeProfileProxy(BluetoothProfile.A2DP, proxy)
-                            if (MediaController.pausedWhileTakingOver) {
-                                MediaController.sendPlay()
-                            }
+                            Log.d(TAG, "not setting connection policy for A2DP, no BLUETOOTH_PRIVILEGED permission. just called connect")
                         }
-                    }
-                    else {
-                        val connectMethod =
-                            proxy.javaClass.getMethod("connect", BluetoothDevice::class.java)
-                        connectMethod.invoke(
-                            proxy, device
-                        )
-                        Log.d(TAG, "not setting connection policy for A2DP, no BLUETOOTH_PRIVILEGED permission. just called connect")
+                    } catch (e: SecurityException) {
+                        Log.w(TAG, "Could not read A2DP connection state: ${e.message}")
+                    } finally {
+                        bluetoothAdapter.closeProfileProxy(BluetoothProfile.A2DP, proxy)
                     }
                 }
             }
@@ -3150,19 +3243,51 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
         isHeadTrackingActive = true
         val useAlternatePackets =
             sharedPreferences.getBoolean("use_alternate_head_tracking_packets", true)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && aacpManager.getControlCommandStatus(
-                AACPManager.Companion.ControlCommandIdentifiers.OWNS_CONNECTION
-            )?.value?.get(0)?.toInt() != 1
-        ) {
-            takeOver("call", startHeadTrackingAgain = true)
-            Log.d(TAG, "Taking over for head tracking")
-        } else {
-            Log.w(TAG, "Will not be taking over for head tracking, might not work.")
+        val ownsConnection = aacpManager.getControlCommandStatus(
+            AACPManager.Companion.ControlCommandIdentifiers.OWNS_CONNECTION
+        )?.value?.getOrNull(0)?.toInt()
+        // Full hijack (with A2DP connect) only when another device owns the link.
+        // When ownership is unknown, soft-claim via AACP so head-tracking data flows
+        // without triggering ACL reconnect storms.
+        var delayStartPackets = false
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && ownsConnection != 1) {
+            when {
+                ownsConnection == 0 -> {
+                    CoroutineScope(Dispatchers.IO).launch {
+                        takeOver("call", startHeadTrackingAgain = true)
+                    }
+                    Log.d(TAG, "Taking over for head tracking")
+                    delayStartPackets = true
+                }
+                BluetoothConnectionManager.aacpSocket?.isConnected == true -> {
+                    aacpManager.sendControlCommand(
+                        AACPManager.Companion.ControlCommandIdentifiers.OWNS_CONNECTION.value, 1
+                    )
+                    Log.d(TAG, "Soft-claimed ownership for head tracking")
+                    delayStartPackets = true
+                }
+                else -> {
+                    Log.w(
+                        TAG,
+                        "Will not be taking over for head tracking (owns=$ownsConnection), might not work."
+                    )
+                }
+            }
         }
-        if (useAlternatePackets) {
-            aacpManager.sendDataPacket(aacpManager.createAlternateStartHeadTrackingPacket())
+        fun sendStartPackets() {
+            if (useAlternatePackets) {
+                aacpManager.sendDataPacket(aacpManager.createAlternateStartHeadTrackingPacket())
+            } else {
+                aacpManager.sendStartHeadTracking()
+            }
+        }
+        if (delayStartPackets) {
+            CoroutineScope(Dispatchers.IO).launch {
+                delay(300)
+                if (isHeadTrackingActive) sendStartPackets()
+            }
         } else {
-            aacpManager.sendStartHeadTracking()
+            sendStartPackets()
         }
         HeadTracking.reset()
     }

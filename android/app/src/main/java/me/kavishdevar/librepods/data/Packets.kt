@@ -18,6 +18,8 @@
 
 package me.kavishdevar.librepods.data
 
+import android.content.Intent
+import android.os.Build
 import android.os.Parcelable
 import android.util.Log
 import kotlinx.parcelize.Parcelize
@@ -63,6 +65,53 @@ data class Battery(val component: Int, val level: Int, val status: Int) : Parcel
             BatteryStatus.DISCONNECTED -> "DISCONNECTED"
             BatteryStatus.OPTIMIZED_CHARGING -> "OPTIMIZED_CHARGING"
             else -> null
+        }
+    }
+
+    companion object {
+        private const val EXTRA_FLAT = "battery_flat"
+        // Legacy Parcelable ArrayList key — kept only for reading older in-flight broadcasts
+        private const val EXTRA_PARCELABLE = "data"
+
+        /**
+         * Pack battery list as a flat int array so broadcasts survive R8/minification.
+         * Custom Parcelables in Intent extras are unreliable once class names are obfuscated.
+         */
+        fun putIntoIntent(intent: Intent, batteries: List<Battery>) {
+            val flat = IntArray(batteries.size * 3)
+            batteries.forEachIndexed { index, battery ->
+                val offset = index * 3
+                flat[offset] = battery.component
+                flat[offset + 1] = battery.level
+                flat[offset + 2] = battery.status
+            }
+            intent.putExtra(EXTRA_FLAT, flat)
+        }
+
+        fun fromIntent(intent: Intent): ArrayList<Battery>? {
+            val flat = intent.getIntArrayExtra(EXTRA_FLAT)
+            if (flat != null && flat.size >= 3 && flat.size % 3 == 0) {
+                val list = ArrayList<Battery>(flat.size / 3)
+                var i = 0
+                while (i < flat.size) {
+                    list.add(Battery(flat[i], flat[i + 1], flat[i + 2]))
+                    i += 3
+                }
+                return list
+            }
+
+            // Legacy path for in-flight broadcasts from older app builds. May NPE under R8.
+            return try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    intent.getParcelableArrayListExtra(EXTRA_PARCELABLE, Battery::class.java)
+                } else {
+                    @Suppress("DEPRECATION")
+                    intent.getParcelableArrayListExtra(EXTRA_PARCELABLE)
+                }
+            } catch (e: Exception) {
+                Log.e("Battery", "Failed to read legacy battery Parcelable extra", e)
+                null
+            }
         }
     }
 }

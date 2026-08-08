@@ -140,6 +140,7 @@ fun AirPodsSettingsRoute(
     navigateToAdaptiveStrength: () -> Unit,
     navigateToEqualizer: () -> Unit,
     navigateToHeadTracking: () -> Unit,
+    navigateToCameraControl: () -> Unit,
     navigateToAccessibility: () -> Unit,
     navigateToVersion: () -> Unit,
     navigateToTroubleshooting: () -> Unit,
@@ -185,6 +186,7 @@ fun AirPodsSettingsRoute(
             navigateToAdaptiveStrength = navigateToAdaptiveStrength,
             navigateToEqualizer = navigateToEqualizer,
             navigateToHeadTracking = navigateToHeadTracking,
+            navigateToCameraControl = navigateToCameraControl,
             navigateToAccessibility = navigateToAccessibility,
             navigateToVersion = navigateToVersion,
             navigateToTroubleshooting = navigateToTroubleshooting,
@@ -227,6 +229,7 @@ fun AirPodsSettingsScreen(
         navigateToAdaptiveStrength: () -> Unit,
         navigateToEqualizer: () -> Unit,
         navigateToHeadTracking: () -> Unit,
+        navigateToCameraControl: () -> Unit,
         navigateToAccessibility: () -> Unit,
         navigateToVersion: () -> Unit,
         navigateToTroubleshooting: () -> Unit,
@@ -401,18 +404,17 @@ fun AirPodsSettingsScreen(
                 )
             }
 
-//                if (capabilities.contains(Capability.STEM_CONFIG) && !BuildConfig.PLAY_BUILD) {
-//                    item(key = "spacer_camera") { Spacer(modifier = Modifier.height(16.dp)) }
-//                    item(key = "camera_control") {
-//                        StyledListItem(
-//                            to = "camera_control",
-//                            name = stringResource(R.string.camera_remote),
-//                            descriptionRes = stringResource(R.string.camera_control_description),
-//                            titleRes = stringResource(R.string.camera_control),
-//                            navController = navController
-//                        )
-//                    }
-//                }
+            if (capabilities.contains(Capability.STEM_CONFIG) && !BuildConfig.PLAY_BUILD) {
+                item(key = "spacer_camera") { Spacer(modifier = Modifier.height(16.dp)) }
+                item(key = "camera_control") {
+                    StyledListItem(
+                        name = stringResource(R.string.camera_remote),
+                        description = stringResource(R.string.camera_control_description),
+                        title = stringResource(R.string.camera_control),
+                        onClick = navigateToCameraControl,
+                    )
+                }
+            }
 
             item(key = "upgrade_button") {
                 if (!state.isPremium) {
@@ -444,7 +446,7 @@ fun AirPodsSettingsScreen(
                 val loudSoundReductionCapability =
                     model.capabilities.contains(Capability.LOUD_SOUND_REDUCTION)
                 val adaptiveAudioCapability =
-                    model.capabilities.contains(Capability.ADAPTIVE_VOLUME)
+                    model.capabilities.contains(Capability.ADAPTIVE_AUDIO)
 
                 val adaptiveVolumeChecked =
                     state.controlStates[AACPManager.Companion.ControlCommandIdentifiers.ADAPTIVE_VOLUME_CONFIG]?.getOrNull(
@@ -561,7 +563,7 @@ fun AirPodsSettingsScreen(
                 )
             }
 
-            if (capabilities.contains(Capability.LOUD_SOUND_REDUCTION)) {
+            if (capabilities.contains(Capability.LISTENING_MODE)) {
                 item(key = "spacer_off_listening") { Spacer(modifier = Modifier.height(16.dp)) }
                 item(key = "off_listening") {
                     val id = AACPManager.Companion.ControlCommandIdentifiers.ALLOW_OFF_OPTION
@@ -570,6 +572,19 @@ fun AirPodsSettingsScreen(
                         description = stringResource(R.string.off_listening_mode_description),
                         checked = state.controlStates[id]?.getOrNull(0) == 0x01.toByte(),
                         onCheckedChange = setOffListeningMode
+                    )
+                }
+            }
+
+            if (capabilities.contains(Capability.CASE_SPEAKER)) {
+                item(key = "spacer_case_tone") { Spacer(modifier = Modifier.height(16.dp)) }
+                item(key = "case_charging_sounds") {
+                    val id = AACPManager.Companion.ControlCommandIdentifiers.IN_CASE_TONE_CONFIG
+                    StyledToggle(
+                        label = stringResource(R.string.case_charging_sounds),
+                        description = stringResource(R.string.case_charging_sounds_description),
+                        checked = state.controlStates[id]?.getOrNull(0) == 0x01.toByte(),
+                        onCheckedChange = { setControlCommandBoolean(id, it) }
                     )
                 }
             }
@@ -961,6 +976,7 @@ fun AirPodsSettingsScreenPreviewApple() {
                 navigateToAdaptiveStrength = {},
                 navigateToEqualizer = {},
                 navigateToHeadTracking = {},
+                navigateToCameraControl = {},
                 navigateToAccessibility = {},
                 navigateToVersion = {},
                 navigateToTroubleshooting = {},
@@ -1008,6 +1024,7 @@ fun AirPodsSettingsScreenPreviewMaterial() {
                 navigateToAdaptiveStrength = {},
                 navigateToEqualizer = {},
                 navigateToHeadTracking = {},
+                navigateToCameraControl = {},
                 navigateToAccessibility = {},
                 navigateToVersion = {},
                 navigateToTroubleshooting = {},

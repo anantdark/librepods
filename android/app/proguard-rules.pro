@@ -21,3 +21,11 @@
 #-renamesourcefileattribute SourceFile
 
 -keep class me.kavishdevar.librepods.utils.KotlinModule { *; }
+
+# Custom Parcelables sent through Intent/Binder must keep names + CREATOR under R8.
+# Without this, BATTERY_DATA broadcasts can crash with NPE in Class.isAssignableFrom.
+-keepnames class * implements android.os.Parcelable
+-keepclassmembers class * implements android.os.Parcelable {
+    public static final ** CREATOR;
+}
+-keep @kotlinx.parcelize.Parcelize class ** { *; }

@@ -182,12 +182,7 @@ class PopupWindow(
         batteryUpdateReceiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context?, intent: Intent?) {
                 if (intent?.action == AirPodsNotifications.BATTERY_DATA) {
-                    val batteryList = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                        intent.getParcelableArrayListExtra("data", Battery::class.java)
-                    } else {
-                        @Suppress("DEPRECATION")
-                        intent.getParcelableArrayListExtra("data")
-                    }
+                    val batteryList = Battery.fromIntent(intent)
                     if (batteryList != null) {
                         updateBatteryStatusFromList(batteryList)
                     }

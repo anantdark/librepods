@@ -64,8 +64,12 @@ android {
                     arguments += "-DCMAKE_BUILD_TYPE=Release"
                 }
             }
-            if (releaseSigningAvailable) {
-                signingConfig = signingConfigs.getByName("release")
+            signingConfig = if (releaseSigningAvailable) {
+                signingConfigs.getByName("release")
+            } else {
+                // Local builds without RELEASE_* in local.properties still need a signing
+                // config so Android Studio can install foss-release / play-release.
+                signingConfigs.getByName("debug")
             }
             defaultConfig {
                 minSdk = 33

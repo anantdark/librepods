@@ -90,6 +90,8 @@
     <string name="sleep_detection">Pause media when falling asleep</string>
     <string name="off_listening_mode">Off Listening Mode</string>
     <string name="off_listening_mode_description">When this is on, AirPods listening modes will include an Off option. Loud sound levels are not reduced when the listening mode is set to Off.</string>
+    <string name="case_charging_sounds">Charging Case Sounds</string>
+    <string name="case_charging_sounds_description">Play a sound from the charging case when it begins charging.</string>
     <string name="microphone">Microphone</string>
     <string name="microphone_mode">Microphone Mode</string>
     <string name="microphone_automatic">Automatic</string>

@@ -80,6 +80,7 @@ data class AirPodsUiState(
 
     val headTrackingActive: Boolean = false,
     val headGesturesEnabled: Boolean = true,
+    val cameraAction: AACPManager.Companion.StemPressType? = AACPManager.Companion.StemPressType.SINGLE_PRESS,
 
     val eqData: FloatArray = floatArrayOf(),
 
@@ -233,19 +234,16 @@ class AirPodsViewModel(
 
     private lateinit var broadcastReceiver: BroadcastReceiver
 
-//    private val _cameraAction = MutableStateFlow(
-//        sharedPreferences.getString("camera_action", null)
-//            ?.let { value -> AACPManager.Companion.StemPressType.entries.find { it.name == value } })
-//
-//    val cameraAction: StateFlow<AACPManager.Companion.StemPressType?> = _cameraAction
-//
-//    fun setCameraAction(action: AACPManager.Companion.StemPressType?) {
-//        sharedPreferences.edit {
-//            if (action == null) remove("camera_action")
-//            else putString("camera_action", action.name)
-//        }
-//        _cameraAction.value = action
-//    }
+    fun setCameraAction(action: AACPManager.Companion.StemPressType?) {
+        sharedPreferences.edit {
+            if (action == null) remove("camera_action")
+            else putString("camera_action", action.name)
+        }
+        _uiState.update { it.copy(cameraAction = action) }
+        if (::service.isInitialized) {
+            service.setupStemActions()
+        }
+    }
 
     fun setCustomEq(low: Int, mid: Int, high: Int) {
         require(low in 0..100)
@@ -311,7 +309,7 @@ class AirPodsViewModel(
             when (key) {
                 "name" -> loadName()
                 "off_listening_mode", "automatic_ear_detection", "automatic_connection_ctrl_cmd",
-                "head_gestures", "left_long_press_action", "right_long_press_action",
+                "head_gestures", "camera_action", "left_long_press_action", "right_long_press_action",
                 "dynamic_end_of_charge", "foss_upgraded", "premium_expiry_time" -> loadSharedPreferences()
             }
         }
@@ -442,6 +440,7 @@ class AirPodsViewModel(
             ControlCommandIdentifiers.AUTO_ANC_STRENGTH,
             ControlCommandIdentifiers.HPS_GAIN_SWIPE,
             ControlCommandIdentifiers.HEARING_ASSIST_CONFIG,
+            ControlCommandIdentifiers.IN_CASE_TONE_CONFIG,
             ControlCommandIdentifiers.ALLOW_OFF_OPTION,
             ControlCommandIdentifiers.STEM_CONFIG,
             ControlCommandIdentifiers.SLEEP_DETECTION_CONFIG,
@@ -481,6 +480,8 @@ class AirPodsViewModel(
         val automaticConnectionEnabled =
             sharedPreferences.getBoolean("automatic_connection_ctrl_cmd", true)
         val headGesturesEnabled = sharedPreferences.getBoolean("head_gestures", true)
+        val cameraAction = sharedPreferences.getString("camera_action", "SINGLE_PRESS")
+            ?.let { name -> AACPManager.Companion.StemPressType.entries.find { it.name == name } }
         val leftAction = StemAction.valueOf(
             sharedPreferences.getString(
                 "left_long_press_action",
@@ -504,6 +505,7 @@ class AirPodsViewModel(
                 automaticEarDetectionEnabled = automaticEarDetectionEnabled,
                 automaticConnectionEnabled = automaticConnectionEnabled,
                 headGesturesEnabled = headGesturesEnabled,
+                cameraAction = cameraAction,
                 leftAction = leftAction,
                 rightAction = rightAction,
                 vendorIdHook = vendorIdHook,

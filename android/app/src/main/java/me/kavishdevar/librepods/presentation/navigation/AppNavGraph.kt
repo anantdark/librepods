@@ -22,6 +22,7 @@ import me.kavishdevar.librepods.presentation.screens.AdaptiveStrengthScreen
 import me.kavishdevar.librepods.presentation.screens.AirPodsSettingsRoute
 import me.kavishdevar.librepods.presentation.screens.AppSettingsScreen
 import me.kavishdevar.librepods.presentation.screens.CallControlScreen
+import me.kavishdevar.librepods.presentation.screens.CameraControlRoute
 import me.kavishdevar.librepods.presentation.screens.EqualizerRoute
 import me.kavishdevar.librepods.presentation.screens.HeadTrackingScreen
 import me.kavishdevar.librepods.presentation.screens.HearingAidAdjustmentsScreen
@@ -106,6 +107,7 @@ fun AppNavGraph(
                                 navigateToAdaptiveStrength = { navigate(Screen.AdaptiveStrength) },
                                 navigateToEqualizer = { navigate(Screen.Equalizer) },
                                 navigateToHeadTracking = { navigate(Screen.HeadTracking) },
+                                navigateToCameraControl = { navigate(Screen.CameraControl) },
                                 navigateToAccessibility = { navigate(Screen.Accessibility) },
                                 navigateToVersion = { navigate(Screen.VersionInfo) },
                                 navigateToTroubleshooting = { navigate(Screen.Troubleshooting) },
@@ -181,10 +183,11 @@ fun AppNavGraph(
                             AdaptiveStrengthScreen(airPodsViewModel, ::navigateToPurchase)
                         }
 
-//                Screen.CameraControl ->
-//                    NavEntry(screen) {
-//                        CameraControlScreen(airPodsViewModel)
-//                    }
+                    Screen.CameraControl ->
+                        NavEntry(screen) {
+                            if (!airPodsViewModel.isReady) LoadingScreen()
+                            CameraControlRoute(airPodsViewModel)
+                        }
 
                     Screen.OpenSourceLicenses ->
                         NavEntry(screen) {

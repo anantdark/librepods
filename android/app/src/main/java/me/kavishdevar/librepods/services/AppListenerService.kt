@@ -30,12 +30,33 @@ private const val TAG="AppListenerService"
 
 val cameraPackages = mutableSetOf(
     "com.google.android.GoogleCamera",
+    "com.google.android.apps.googlecamera",
     "com.sec.android.app.camera",
     "com.android.camera",
+    "com.android.camera2",
+    "com.miui.camera",
+    "com.xiaomi.camera",
+    "com.xiaomi.scanner",
     "com.oppo.camera",
+    "com.oneplus.camera",
+    "com.huawei.camera",
+    "com.honor.camera",
+    "com.vivo.camera",
     "com.motorola.camera2",
-    "org.codeaurora.snapcam"
+    "com.motorola.camera3",
+    "org.codeaurora.snapcam",
+    "com.transsion.camera"
 )
+
+private fun isCameraPackage(pkg: String): Boolean {
+    if (pkg in cameraPackages) return true
+    // Catch OEM variants (e.g. HyperOS / MIUI forks) without listing every id.
+    val lower = pkg.lowercase()
+    return lower.contains("camera") &&
+        !lower.contains("systemui") &&
+        !lower.contains("permission") &&
+        !lower.contains("provider")
+}
 
 var cameraOpen = false
 private var currentCustomPackage: String? = null
@@ -75,7 +96,7 @@ class AppListenerService: AccessibilityService() {
                 val pkg = ev.packageName?.toString() ?: return
                 if (pkg == "com.android.systemui") return // after camera opens, systemui is opened, probably for the privacy indicators
                 Log.d(TAG, "Package: $pkg, cameraOpen: $cameraOpen")
-                if (pkg in cameraPackages) {
+                if (isCameraPackage(pkg)) {
                     Log.d(TAG, "Camera app opened: $pkg")
                     if (!cameraOpen) cameraOpen = true
                     ServiceManager.getService()?.cameraOpened()
@@ -87,7 +108,6 @@ class AppListenerService: AccessibilityService() {
                         Log.d(TAG, "ignoring")
                     }
                 }
-                // Log.d(TAG, "Opened: $pkg")
             }
         } catch(e: Exception) {
             Log.e(TAG, "Error in onAccessibilityEvent: ${e.message}")

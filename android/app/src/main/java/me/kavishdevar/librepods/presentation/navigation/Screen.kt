@@ -43,8 +43,8 @@ sealed interface Screen: NavKey {
     @Serializable
     data object AdaptiveStrength: Screen
 
-//    @Serializable
-//    data object CameraControl: Screen
+    @Serializable
+    data object CameraControl: Screen
 
     @Serializable
     data object OpenSourceLicenses: Screen

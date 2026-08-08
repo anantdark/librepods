@@ -262,21 +262,18 @@ fun AppSettingsScreen(
                 enabled = state.isPremium
             )
 
-//            if (!BuildConfig.PLAY_BUILD) {
-//                Spacer(modifier = Modifier.height(16.dp))
-//
-//                StyledListItem(
-//                    to = "",
-//                    titleRes = stringResource(R.string.camera_control),
-//                    name = stringResource(R.string.set_custom_camera_package),
-//                    navController = navController,
-//                    onClick = {
-//                        if (state.isPremium) viewModel.setShowCameraDialog(true)
-//                    },
-//                    independent = true,
-//                    descriptionRes = stringResource(R.string.camera_control_app_description)
-//                )
-//            }
+            if (!BuildConfig.PLAY_BUILD) {
+                Spacer(modifier = Modifier.height(16.dp))
+
+                StyledListItem(
+                    title = stringResource(R.string.camera_control),
+                    name = stringResource(R.string.set_custom_camera_package),
+                    description = stringResource(R.string.camera_control_app_description),
+                    onClick = {
+                        if (state.isPremium) viewModel.setShowCameraDialog(true)
+                    },
+                )
+            }
 
             Spacer(modifier = Modifier.height(16.dp))
             if (context.checkSelfPermission("android.permission.BLUETOOTH_PRIVILEGED") == PackageManager.PERMISSION_GRANTED) {
