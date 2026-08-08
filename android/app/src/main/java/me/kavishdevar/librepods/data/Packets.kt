@@ -233,19 +233,25 @@ class AirPodsNotifications {
             caseLevel: Int?,
             caseCharging: Boolean
         ) {
-            // BLE proximity uses 0x7F (127) as "unknown"; never surface >100% in UI.
+            // BLE proximity uses 0x7F (127) as "unknown"; never surface >100%.
+            // Keep the previous reading when a component is unknown so RPA churn/sentinels
+            // don't blank the nearby UI (DISCONNECTED + 0% is hidden by BatteryView).
             fun clamp(level: Int?): Int? = level?.takeIf { it in 0..100 }
-            fun status(level: Int?, charging: Boolean) = when {
-                level == null -> BatteryStatus.DISCONNECTED
-                charging -> BatteryStatus.CHARGING
-                else -> BatteryStatus.NOT_CHARGING
+            fun merge(incoming: Int?, charging: Boolean, previous: Battery): Battery {
+                val level = clamp(incoming)
+                if (level == null) {
+                    return if (previous.status != BatteryStatus.DISCONNECTED && previous.level in 0..100) {
+                        previous
+                    } else {
+                        Battery(previous.component, 0, BatteryStatus.DISCONNECTED)
+                    }
+                }
+                val status = if (charging) BatteryStatus.CHARGING else BatteryStatus.NOT_CHARGING
+                return Battery(previous.component, level, status)
             }
-            val left = clamp(leftLevel)
-            val right = clamp(rightLevel)
-            val caseLvl = clamp(caseLevel)
-            first = Battery(BatteryComponent.LEFT, left ?: 0, status(left, leftCharging))
-            second = Battery(BatteryComponent.RIGHT, right ?: 0, status(right, rightCharging))
-            case = Battery(BatteryComponent.CASE, caseLvl ?: 0, status(caseLvl, caseCharging))
+            first = merge(leftLevel, leftCharging, first)
+            second = merge(rightLevel, rightCharging, second)
+            case = merge(caseLevel, caseCharging, case)
         }
 
         fun clear() {
@@ -258,31 +264,27 @@ class AirPodsNotifications {
             if (data.size != 22) {
                 return
             }
-//            first = if (data[10].toInt() == BatteryStatus.DISCONNECTED) {
-//                Battery(first.component, first.level, data[10].toInt())
-//            } else {
-//                Battery(data[7].toInt(), data[9].toInt(), data[10].toInt())
-//            }
-//            second = if (data[15].toInt() == BatteryStatus.DISCONNECTED) {
-//                Battery(second.component, second.level, data[15].toInt())
-//            } else {
-//                Battery(data[12].toInt(), data[14].toInt(), data[15].toInt())
-//            }
-//            case = if (data[20].toInt() == BatteryStatus.DISCONNECTED && case.status != BatteryStatus.DISCONNECTED) {
-//                Battery(case.component, case.level, data[20].toInt())
-//            } else {
-//                Battery(data[17].toInt(), data[19].toInt(), data[20].toInt())
-//            }
-//            sometimes it shows battery as -1%, just skip all that and set it normally
-            first = Battery(
-                data[7].toInt(), data[9].toInt(), data[10].toInt()
-            )
-            second = Battery(
-                data[12].toInt(), data[14].toInt(), data[15].toInt()
-            )
-            case = Battery(
-                data[17].toInt(), data[19].toInt(), data[20].toInt()
-            )
+            // Levels are unsigned; 0xFF/-1 and 0x7F/127 are Apple "unknown" sentinels.
+            // Keep the last good reading instead of publishing -1% or blanking the UI.
+            fun parse(compIdx: Int, levelIdx: Int, statusIdx: Int, previous: Battery): Battery {
+                val component = data[compIdx].toInt() and 0xFF
+                val level = data[levelIdx].toInt() and 0xFF
+                val status = data[statusIdx].toInt() and 0xFF
+                if (status == BatteryStatus.DISCONNECTED) {
+                    return Battery(component, previous.level.takeIf { it in 0..100 } ?: 0, status)
+                }
+                if (level !in 0..100) {
+                    return if (previous.level in 0..100) {
+                        Battery(component, previous.level, status)
+                    } else {
+                        Battery(component, 0, BatteryStatus.DISCONNECTED)
+                    }
+                }
+                return Battery(component, level, status)
+            }
+            first = parse(7, 9, 10, first)
+            second = parse(12, 14, 15, second)
+            case = parse(17, 19, 20, case)
         }
 
         fun getBattery(): List<Battery> {

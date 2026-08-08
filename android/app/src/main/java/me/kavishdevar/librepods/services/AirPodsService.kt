@@ -310,7 +310,8 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
         }
 
         override fun onBatteryChanged(device: BLEManager.AirPodsStatus) {
-            applyBleBatteryToUi(notifyNearby = false)
+            // Keep nearby UI subscribed; BATTERY_DATA alone is easy to miss after RPA churn.
+            applyBleBatteryToUi(notifyNearby = true)
             Log.d(TAG, "Battery changed")
         }
 

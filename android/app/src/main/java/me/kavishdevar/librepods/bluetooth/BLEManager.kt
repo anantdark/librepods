@@ -99,9 +99,10 @@ class BLEManager(private val context: Context) {
     private var lastBroadcastTime: Long = 0
     private val processedAddresses = mutableSetOf<String>()
 
-    private val lastValidLeftBatteryMap = mutableMapOf<String, Int>()
-    private val lastValidRightBatteryMap = mutableMapOf<String, Int>()
-    private val lastValidCaseBatteryMap = mutableMapOf<String, Int>()
+    // Global (not per-RPA): AirPods rotate BLE addresses, so address-keyed caches miss and wipe UI.
+    private var lastValidLeftBattery: Int? = null
+    private var lastValidRightBattery: Int? = null
+    private var lastValidCaseBattery: Int? = null
     @Volatile private var isScanning = false
     @Volatile private var currentPowerMode = ScanPowerMode.LOW_POWER
     /** When true, prefer LOW_POWER even if pods are nearby (AACP already connected). */
@@ -466,16 +467,9 @@ class BLEManager(private val context: Context) {
         return Pair(charging, level.takeIf { it in 0..100 })
     }
 
-    private fun resolveBattery(
-        address: String,
-        level: Int?,
-        cache: MutableMap<String, Int>
-    ): Int? {
-        if (level != null) {
-            cache[address] = level
-            return level
-        }
-        return cache[address]
+    private fun resolveBattery(level: Int?, previous: Int?): Int? {
+        if (level != null) return level
+        return previous
     }
 
     private fun processScanResult(result: ScanResult) {
@@ -594,9 +588,9 @@ class BLEManager(private val context: Context) {
         val (isRightCharging, rawRightBattery) = formatBattery(decrypted[rightByteIndex].toInt() and 0xFF)
         val (isCaseCharging, rawCaseBattery) = formatBattery(decrypted[3].toInt() and 0xFF)
 
-        val leftBattery = resolveBattery(address, rawLeftBattery, lastValidLeftBatteryMap)
-        val rightBattery = resolveBattery(address, rawRightBattery, lastValidRightBatteryMap)
-        val caseBattery = resolveBattery(address, rawCaseBattery, lastValidCaseBatteryMap)
+        val leftBattery = resolveBattery(rawLeftBattery, lastValidLeftBattery)?.also { lastValidLeftBattery = it }
+        val rightBattery = resolveBattery(rawRightBattery, lastValidRightBattery)?.also { lastValidRightBattery = it }
+        val caseBattery = resolveBattery(rawCaseBattery, lastValidCaseBattery)?.also { lastValidCaseBattery = it }
 
         val lidOpen = ((lid shr 3) and 0x01) == 0
 
@@ -628,9 +622,6 @@ class BLEManager(private val context: Context) {
 
         for (device in staleDevices) {
             deviceStatusMap.remove(device.key)
-            lastValidLeftBatteryMap.remove(device.key)
-            lastValidRightBatteryMap.remove(device.key)
-            lastValidCaseBatteryMap.remove(device.key)
             Log.d(TAG, "Removed stale device from tracking: ${device.key}")
         }
 
