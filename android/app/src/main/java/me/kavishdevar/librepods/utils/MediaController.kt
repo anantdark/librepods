@@ -56,29 +56,19 @@ object MediaController {
     private const val PLAYBACK_ACTIVE_HOLD_MS = 5_000L
 
     /**
-     * After Mac takes audio — hold long enough for Secondary AACP refresh (~28s) + pause settle.
-     * Short holds let residual NewPipe configs clear the flag and hard-claim Mac's stream.
+     * Match a3b6882: short paused clear + fixed 3s recentlyLost.
+     * Long/extendable holds blocked Android↔Mac reclaim after yield.
      */
-    private const val YIELD_TO_OTHER_DEVICE_HOLD_MS = 45_000L
-    private const val RECENTLY_LOST_OWNERSHIP_MS = 20_000L
-    private val clearPausedForOtherDeviceRunnable: Runnable = object : Runnable {
-        override fun run() {
-            // Stay yielded while coordinator still says Mac owns / Secondary.
-            val service = ServiceManager.getService()
-            if (service != null && service.shouldHoldYieldToOtherDevice()) {
-                handler.postDelayed(this, YIELD_TO_OTHER_DEVICE_HOLD_MS)
-                Log.d("MediaController", "Keeping pausedForOtherDevice — Mac/other still owns audio")
-                return
-            }
-            pausedForOtherDevice = false
-            Log.d(
-                "MediaController",
-                "Cleared pausedForOtherDevice after timeout, resuming normal playback monitoring"
-            )
-        }
+    private const val PAUSED_FOR_OTHER_DEVICE_CLEAR_MS = 500L
+    private const val RECENTLY_LOST_OWNERSHIP_MS = 3_000L
+    private val clearPausedForOtherDeviceRunnable = Runnable {
+        pausedForOtherDevice = false
+        Log.d(
+            "MediaController",
+            "Cleared pausedForOtherDevice after timeout, resuming normal playback monitoring"
+        )
     }
     private val clearRecentlyLostOwnershipRunnable = Runnable {
-        // Fixed window only — do not extend while Mac owns, or user play can never reclaim.
         recentlyLostOwnership = false
         Log.d("MediaController", "Cleared recentlyLostOwnership after yield hold")
     }
@@ -229,29 +219,26 @@ object MediaController {
             Log.d("MediaController", "Has media play signal: $hasNewMusicOrMovie")
 
             if (pausedForOtherDevice) {
-                // Do NOT reschedule with a short timeout — residual pause configs used to
-                // shrink the yield hold to 500ms and let keep-alive steal Mac audio.
-                val macStillOwns = service?.shouldHoldYieldToOtherDevice() == true
-                val truePlayEdge = isActive && lastKnownIsMusicActive != true && hasNewMusicOrMovie
+                // a3b6882: refresh short clear timer; play edge after recentlyLost → reclaim.
+                handler.removeCallbacks(clearPausedForOtherDeviceRunnable)
+                handler.postDelayed(clearPausedForOtherDeviceRunnable, PAUSED_FOR_OTHER_DEVICE_CLEAR_MS)
 
-                // After the post-yield settle window, a real play edge reclaims (steals from Mac).
-                // recentlyLostOwnership blocks residual NewPipe configs right after our pause.
-                if (truePlayEdge && !recentlyLostOwnership) {
-                    Log.d(
-                        "MediaController",
-                        "User play while yielded — reclaiming (macStillOwns=$macStillOwns)"
-                    )
-                    pausedForOtherDevice = false
-                    userPlayedTheMedia = true
-                    if (!pausedWhileTakingOver) {
-                        requestMusicOwnershipClaim()
+                if (isActive) {
+                    Log.d("MediaController", "Detected play while pausedForOtherDevice; attempting to take over")
+                    if (!recentlyLostOwnership && hasNewMusicOrMovie) {
+                        pausedForOtherDevice = false
+                        userPlayedTheMedia = true
+                        if (!pausedWhileTakingOver) {
+                            requestMusicOwnershipClaim()
+                        }
+                    } else {
+                        Log.d(
+                            "MediaController",
+                            "Skipping take-over due to recent ownership loss or no claim-worthy media"
+                        )
                     }
-                } else if (isActive) {
-                    Log.d(
-                        "MediaController",
-                        "Ignoring playback while yielded " +
-                            "(macStillOwns=$macStillOwns recentlyLost=$recentlyLostOwnership playEdge=$truePlayEdge)"
-                    )
+                } else {
+                    Log.d("MediaController", "Still not active while pausedForOtherDevice; will clear state after timeout")
                 }
 
                 lastKnownIsMusicActive = isActive && hasNewMusicOrMovie
@@ -314,10 +301,10 @@ object MediaController {
         return true
     }
 
-    /** Play-edge → ownership coordinator when present; else legacy takeOver("music"). */
+    /** Play-edge → a3b6882 takeOver("music"). */
     @RequiresApi(Build.VERSION_CODES.R)
     private fun requestMusicOwnershipClaim() {
-        ServiceManager.getService()?.requestMusicOwnershipFromPlayEdge()
+        ServiceManager.getService()?.takeOver("music")
     }
 
     @Synchronized
@@ -423,7 +410,7 @@ object MediaController {
         pausedForOtherDevice = true
         recentlyLostOwnership = true
         handler.removeCallbacks(clearPausedForOtherDeviceRunnable)
-        handler.postDelayed(clearPausedForOtherDeviceRunnable, YIELD_TO_OTHER_DEVICE_HOLD_MS)
+        handler.postDelayed(clearPausedForOtherDeviceRunnable, PAUSED_FOR_OTHER_DEVICE_CLEAR_MS)
         handler.removeCallbacks(clearRecentlyLostOwnershipRunnable)
         handler.postDelayed(clearRecentlyLostOwnershipRunnable, RECENTLY_LOST_OWNERSHIP_MS)
     }

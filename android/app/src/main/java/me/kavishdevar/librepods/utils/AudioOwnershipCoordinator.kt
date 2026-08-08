@@ -68,6 +68,8 @@ class AudioOwnershipCoordinator(
         fun setOtherDeviceTookOver(value: Boolean)
         /** Phone-state + AirPods-status toggles for music hard claim. */
         fun isMusicTakeOverAllowedByPrefs(): Boolean
+        /** Mac MEDIA returned while we own — re-Hijackv2 so Mac actually pauses. */
+        fun reinforceMacPause()
     }
 
     @Volatile
@@ -89,11 +91,13 @@ class AudioOwnershipCoordinator(
         /** One hard claim per intent edge; confirm retry uses the same window. */
         private const val HARD_CLAIM_DEBOUNCE_MS = 1_500L
         private const val CONFIRM_RETRY_DELAY_MS = 1_500L
+        /** Ignore Mac MEDIA flaps this long after Hijackv2 so reclaim can stick. */
+        private const val HARD_CLAIM_SETTLE_MS = 5_000L
         /**
          * Hold Secondary after Mac takes audio even if audio-source briefly reports NONE.
-         * Leaving Secondary early lets soft-OWNS steal Mac playback.
+         * Match a3b6882 recentlyLost window — 20s blocked Android reclaim.
          */
-        private const val SECONDARY_HOLD_MS = 20_000L
+        private const val SECONDARY_HOLD_MS = 3_000L
     }
 
     /**
@@ -130,13 +134,15 @@ class AudioOwnershipCoordinator(
             Log.d(TAG, "onLocalPlayStarted: blocked (call priority or Mac CALL)")
             return
         }
-        if (!host.isMusicTakeOverAllowedByPrefs()) {
+        // a3b6882: Android play steals from Mac via A2DP even when takeover toggles are off.
+        // Prefs only gate idle/auto hijack — not an explicit local play edge.
+        val fromSecondary = state == State.Secondary || host.otherIsAudioSource()
+        if (!fromSecondary && !host.isMusicTakeOverAllowedByPrefs()) {
             Log.d(TAG, "onLocalPlayStarted: blocked by App Settings takeover toggles")
             return
         }
         if (!shouldHardClaim("music")) return
 
-        val fromSecondary = state == State.Secondary || host.otherIsAudioSource()
         state = State.OwningMedia
         host.setOtherDeviceTookOver(false)
         if (fromSecondary) {
@@ -152,60 +158,26 @@ class AudioOwnershipCoordinator(
      * Yield audio ownership whenever Mac/other is the source (track switch, Mac play, CALL).
      * Stay AACP-linked via notification keep-alive + silent relink — never soft-OWNS fight.
      */
+    /**
+     * Media yield/claim is owned by AirPodsService a3b6882 paths (onAudioSourceReceived /
+     * takeOver). Coordinator must not re-yield or fight A2DP after Android hard-claim.
+     */
     fun onOtherAudioSource(key: String, otherIsSource: Boolean) {
+        if (key == lastAudioSourceKey) return
+        lastAudioSourceKey = key
         if (!otherIsSource) {
-            if (key == lastAudioSourceKey) return
-            lastAudioSourceKey = key
             if (state == State.Secondary) {
-                val heldMs = System.currentTimeMillis() - secondarySinceMs
-                // A2DP reconnect can briefly mark the phone as audio source and steal Mac
-                // media even when takeover toggles are off. Only leave Secondary on local
-                // ownership when App Settings allow music takeover; otherwise re-yield.
-                if (host.localOwnsAudioSource()) {
-                    if (host.isMusicTakeOverAllowedByPrefs()) {
-                        state = State.LinkedIdle
-                        Log.d(TAG, "onOtherAudioSource: local owns audio → LinkedIdle")
-                    } else {
-                        Log.d(
-                            TAG,
-                            "onOtherAudioSource: local owns but media takeover off — re-yield"
-                        )
-                        host.yieldToOtherDevice(keepHeadset = true)
-                        host.setOtherDeviceTookOver(true)
-                    }
-                    return
-                }
-                // Time-only hold for NONE flaps during Mac handoff.
-                // Do NOT pin on isLocalPlaying — residual/resume configs + keep-alive pauses
-                // made Secondary sticky forever and blocked Android audio.
-                if (heldMs < SECONDARY_HOLD_MS) {
-                    Log.d(TAG, "onOtherAudioSource: hold Secondary (${heldMs}ms, NONE flap)")
-                    return
-                }
                 state = State.LinkedIdle
-                Log.d(TAG, "onOtherAudioSource: Secondary hold expired → LinkedIdle")
+                Log.d(TAG, "onOtherAudioSource: cleared Secondary → LinkedIdle")
             }
             return
         }
-
         if (host.isRinging() || host.isInCall() || state == State.OwningCall) {
-            Log.d(TAG, "onOtherAudioSource: ignore yield — OwningCall")
-            lastAudioSourceKey = key
+            Log.d(TAG, "onOtherAudioSource: ignore — OwningCall")
             return
         }
-
-        // Already yielded for this source key — skip spam (~15Hz). Re-yield if we had
-        // reclaimed (OwningMedia) so Mac play / track switch pauses Android again.
-        if (key == lastAudioSourceKey && state == State.Secondary) return
-        lastAudioSourceKey = key
-
-        val reason = if (host.otherSourceIsCall()) "CALL" else "MEDIA"
-        Log.d(TAG, "onOtherAudioSource → Secondary (Mac $reason — pause Android, release audio)")
-        cancelConfirmRetry()
+        // Bookkeeping only — AirPodsService already paused/disconnected for Mac MEDIA.
         enterSecondary()
-        host.yieldToOtherDevice(keepHeadset = true)
-        host.setOtherDeviceTookOver(true)
-        host.showYieldIslandWithReverse()
     }
 
     /** Telephony RINGING / OFFHOOK / IDLE. Call > media. */
@@ -252,10 +224,10 @@ class AudioOwnershipCoordinator(
     fun onOwnershipLost() {
         if (host.isRinging() || host.isInCall() || state == State.OwningCall) return
         if (state == State.Secondary) return
-
+        // a3b6882: always yield — no reinforce on OWNS flaps.
         Log.d(TAG, "onOwnershipLost → Secondary (yield audio to peer)")
         enterSecondary()
-        host.yieldToOtherDevice(keepHeadset = true)
+        host.yieldToOtherDevice(keepHeadset = host.otherSourceIsCall())
         host.setOtherDeviceTookOver(true)
         host.showYieldIslandWithReverse()
     }
