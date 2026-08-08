@@ -213,7 +213,10 @@ class AirPodsViewModel(
         observeAACP()
         loadCurrentStatus()
         loadEq()
-        loadATT()
+        // ATT reads block on LinkedBlockingQueue.poll — never on main (ANR in onServiceConnected).
+        viewModelScope.launch(Dispatchers.IO) {
+            loadATT()
+        }
         observeATT()
         observeSharedPreferences()
         observeBilling()

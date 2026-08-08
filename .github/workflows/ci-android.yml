@@ -3,7 +3,7 @@ name: Android CI
 on:
   push:
     branches:
-      - '*'
+      - 'personal/android-stability-and-features'
     paths:
       - 'android/**'
       - 'root-module-manual/**'
@@ -16,7 +16,7 @@ on:
       branch:
         description: Branch to build
         required: true
-        default: main
+        default: personal/android-stability-and-features
   workflow_call:
 
 jobs:

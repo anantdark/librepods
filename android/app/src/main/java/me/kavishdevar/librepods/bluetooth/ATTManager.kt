@@ -81,6 +81,10 @@ class ATTManagerv2 {
     fun getCharacteristic(handle: ATTHandles): ByteArray? {
         val storedValue = characteristicList[handle]
         return if (storedValue?.isNotEmpty() != true) {
+            if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
+                Log.w(TAG, "Skipping blocking ATT read on main thread for handle ${handle.value}")
+                return storedValue
+            }
             readCharacteristic(handle)
         } else storedValue
     }

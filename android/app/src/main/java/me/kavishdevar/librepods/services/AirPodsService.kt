@@ -55,6 +55,7 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.ParcelUuid
+import android.os.SystemClock
 import android.os.UserHandle
 import android.provider.Settings
 import android.telecom.TelecomManager
@@ -131,6 +132,7 @@ import me.kavishdevar.librepods.utils.SystemApisUtils.METADATA_UNTETHERED_RIGHT_
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.io.encoding.Base64
 import kotlin.io.encoding.ExperimentalEncodingApi
 import kotlin.time.Duration.Companion.milliseconds
@@ -161,6 +163,8 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
     var cameraActive = false
     private var disconnectedBecauseReversed = false
     private var otherDeviceTookOver = false
+    private val socketConnecting = AtomicBoolean(false)
+    @Volatile private var lastSocketConnectAttemptMs = 0L
 
     data class ServiceConfig(
         var deviceName: String = "AirPods",
@@ -1774,6 +1778,9 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
 
     private lateinit var earReceiver: BroadcastReceiver
     var widgetMobileBatteryEnabled = false
+    @Volatile private var lastBatteryUiUpdateMs = 0L
+    @Volatile private var lastStatusNotificationMs = 0L
+    @Volatile private var lastStatusNotificationText: String? = null
 
     object BatteryChangedIntentReceiver : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent) {
@@ -2033,6 +2040,9 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
     @SuppressLint("MissingPermission")
     @OptIn(ExperimentalMaterial3Api::class)
     fun updateBattery() {
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastBatteryUiUpdateMs < 750L) return
+        lastBatteryUiUpdateMs = now
         setBatteryMetadata()
         updateBatteryWidget()
         sendBatteryBroadcast()
@@ -2111,11 +2121,7 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
             return
         }
         if (BluetoothConnectionManager.aacpSocket?.isConnected == true) {
-            val updatedNotificationBuilder =
-                NotificationCompat.Builder(this, "airpods_connection_status")
-                    .setSmallIcon(R.drawable.airpods)
-                    .setContentTitle(airpodsName ?: config.deviceName).setContentText(
-                        """${
+            val contentText = """${
                         batteryList?.find { it.component == BatteryComponent.LEFT }?.let {
                             if (it.status != BatteryStatus.DISCONNECTED) {
                                 "L: ${if (it.status == BatteryStatus.CHARGING) "⚡" else ""} ${it.level}%"
@@ -2139,8 +2145,24 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
                                 ""
                             }
                         } ?: ""
-                    }""").setContentIntent(pendingIntent).setCategory(Notification.CATEGORY_STATUS)
+                    }"""
+            val title = airpodsName ?: config.deviceName
+            val fingerprint = "$title|$contentText|$disconnectedBecauseReversed"
+            val now = SystemClock.elapsedRealtime()
+            // System sheds notifications when enqueue rate > ~5/s; BLE battery spam was ANR-adjacent.
+            if (fingerprint == lastStatusNotificationText && now - lastStatusNotificationMs < 1000L) {
+                return
+            }
+            lastStatusNotificationText = fingerprint
+            lastStatusNotificationMs = now
+
+            val updatedNotificationBuilder =
+                NotificationCompat.Builder(this, "airpods_connection_status")
+                    .setSmallIcon(R.drawable.airpods)
+                    .setContentTitle(title).setContentText(contentText)
+                    .setContentIntent(pendingIntent).setCategory(Notification.CATEGORY_STATUS)
                     .setPriority(NotificationCompat.PRIORITY_LOW).setOngoing(true)
+                    .setOnlyAlertOnce(true)
 
             if (disconnectedBecauseReversed) {
                 updatedNotificationBuilder.addAction(
@@ -2722,8 +2744,49 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
             }
             return
         }
-        if (BluetoothConnectionManager.aacpSocket != null && BluetoothConnectionManager.aacpSocket?.isConnected == true) return
+        if (BluetoothConnectionManager.aacpSocket?.isConnected == true) return
+
+        val now = SystemClock.elapsedRealtime()
+        if (!manual && now - lastSocketConnectAttemptMs < 2500L) {
+            Log.d(TAG, "Skipping L2CAP connect; attempted ${now - lastSocketConnectAttemptMs}ms ago")
+            return
+        }
+        if (!socketConnecting.compareAndSet(false, true)) {
+            Log.d(TAG, "Skipping L2CAP connect; another attempt is in progress")
+            return
+        }
+        lastSocketConnectAttemptMs = now
+
+        try {
+            connectToSocketLocked(adapter, device, manual)
+        } finally {
+            socketConnecting.set(false)
+        }
+    }
+
+    @SuppressLint("MissingPermission", "UnspecifiedRegisterReceiverFlag")
+    private fun connectToSocketLocked(
+        adapter: BluetoothAdapter, device: BluetoothDevice, manual: Boolean
+    ) {
+        if (BluetoothConnectionManager.aacpSocket?.isConnected == true) return
         Log.d(TAG, "<LogCollector:Start> Connecting to socket")
+
+        // Drop half-open sockets so the stack can free PSM 0x1001 (avoids "no RCB available").
+        try {
+            BluetoothConnectionManager.attSocket?.close()
+        } catch (_: Exception) {
+        }
+        try {
+            BluetoothConnectionManager.aacpSocket?.close()
+        } catch (_: Exception) {
+        }
+        BluetoothConnectionManager.attSocket = null
+        BluetoothConnectionManager.aacpSocket = null
+        try {
+            attManager.stopReader()
+        } catch (_: Exception) {
+        }
+
         val uuid: ParcelUuid = ParcelUuid.fromString("74ec2172-0bad-4d01-8f77-997b2be0722a")
 //        if (!isConnectedLocally) {
         val socket = try {
@@ -2738,6 +2801,8 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
             runBlocking {
                 withTimeout(5000.milliseconds) {
                     try {
+                        // Brief settle so Capod/system Obex can release a conflicting PSM registration.
+                        delay(300.milliseconds)
                         socket.connect()
                         this@AirPodsService.device = device
                         val xposedRemotePref = XposedRemotePrefProvider.create()
@@ -2800,12 +2865,21 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
                         Log.d(
                             TAG, "<LogCollector:Complete:Failed> Socket not connected, ${e.message}"
                         )
+                        try {
+                            socket.close()
+                        } catch (_: Exception) {
+                        }
+                        val hint = when {
+                            e.message?.contains("closed", ignoreCase = true) == true ||
+                                e.message?.contains("read failed", ignoreCase = true) == true ||
+                                e.message?.contains("RCB", ignoreCase = true) == true ->
+                                "L2CAP busy — force-stop Capod/other AirPods apps, then reconnect"
+                            else -> e.localizedMessage ?: e.message ?: "unknown error"
+                        }
                         if (manual) {
-                            sendToast(
-                                "Couldn't connect to socket: ${e.localizedMessage}"
-                            )
+                            sendToast("Couldn't connect to socket: $hint")
                         } else {
-                            showSocketConnectionFailureNotification("Couldn't connect to socket: ${e.localizedMessage}")
+                            showSocketConnectionFailureNotification("Couldn't connect to socket: $hint")
                         }
                         return@withTimeout
 //                            throw e // lol how did i not catch this before... gonna comment this line instead of removing to preserve history
@@ -2814,12 +2888,18 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
             }
             if (!socket.isConnected) {
                 Log.d(TAG, "<LogCollector:Complete:Failed> socket not connected")
+                try {
+                    socket.close()
+                } catch (_: Exception) {
+                }
                 if (manual) {
                     sendToast(
-                        "Couldn't connect to socket: timeout."
+                        "Couldn't connect to socket: timeout. Stop Capod if it's running."
                     )
                 } else {
-                    showSocketConnectionFailureNotification("Couldn't connect to socket: Timeout")
+                    showSocketConnectionFailureNotification(
+                        "Couldn't connect to socket: Timeout. Another app may be using L2CAP PSM 0x1001."
+                    )
                 }
                 return
             }
@@ -2916,6 +2996,10 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
         } catch (e: Exception) {
             e.printStackTrace()
             Log.d(TAG, "Failed to connect to BluetoothConnectionManager.aacpSocket?: ${e.message}")
+            try {
+                socket.close()
+            } catch (_: Exception) {
+            }
             showSocketConnectionFailureNotification("Failed to establish connection: ${e.localizedMessage}")
 //                isConnectedLocally = false
             this@AirPodsService.device = device
