@@ -405,15 +405,53 @@ class AACPManager {
 
     @OptIn(ExperimentalStdlibApi::class)
     fun receivePacket(packet: ByteArray) {
-        if (!packet.toHexString().startsWith("04000400")) {
+        // L2CAP often delivers several AACP frames in one read. Processing only the first
+        // opcode dropped trailing CONTROL_COMMAND (LISTENING_MODE) frames — Mac→app sync died.
+        val frames = splitAacpFrames(packet)
+        if (frames.isEmpty()) {
             Log.w(
                 TAG, "Received packet does not start with expected header: ${
-                packet.joinToString(" ") {
-                    "%02X".format(it)
-                }
+                packet.joinToString(" ") { "%02X".format(it) }
             }")
             return
         }
+        if (frames.size > 1) {
+            Log.d(TAG, "Split AACP read into ${frames.size} frames")
+        }
+        for (frame in frames) {
+            receiveSinglePacket(frame)
+        }
+    }
+
+    /** Split a buffer into AACP frames starting at each `04 00 04 00` header. */
+    private fun splitAacpFrames(data: ByteArray): List<ByteArray> {
+        if (data.size < 6) return emptyList()
+        val starts = ArrayList<Int>()
+        var i = 0
+        while (i <= data.size - 4) {
+            if (data[i] == 0x04.toByte() &&
+                data[i + 1] == 0x00.toByte() &&
+                data[i + 2] == 0x04.toByte() &&
+                data[i + 3] == 0x00.toByte()
+            ) {
+                starts.add(i)
+                i += 4
+            } else {
+                i++
+            }
+        }
+        if (starts.isEmpty()) return emptyList()
+        val frames = ArrayList<ByteArray>(starts.size)
+        for (idx in starts.indices) {
+            val start = starts[idx]
+            val end = if (idx + 1 < starts.size) starts[idx + 1] else data.size
+            if (end - start >= 6) frames.add(data.copyOfRange(start, end))
+        }
+        return frames
+    }
+
+    @OptIn(ExperimentalStdlibApi::class)
+    private fun receiveSinglePacket(packet: ByteArray) {
         if (packet.size < 6) {
             Log.w(
                 TAG, "Received packet too short: ${packet.joinToString(" ") { "%02X".format(it) }}"
@@ -462,15 +500,18 @@ class AACPManager {
 
                 val controlCommandIdentifier =
                     ControlCommandIdentifiers.fromByte(controlCommand.identifier)
-                if (controlCommandIdentifier != null) {
-                    controlCommandListeners[controlCommandIdentifier]?.forEach { listener ->
-                        Log.d(TAG, "calling listener for ${controlCommandIdentifier.name}")
-                        listener.onControlCommandReceived(controlCommand)
-                    }
-                } else {
+                // Listeners already notified in setControlCommandStatusValue — do not double-fire.
+                if (controlCommandIdentifier == null) {
                     Log.w(
                         TAG,
                         "Unknown control command identifier: ${controlCommand.identifier.toHexString()}"
+                    )
+                } else if (controlCommandIdentifier == ControlCommandIdentifiers.LISTENING_MODE) {
+                    Log.d(
+                        TAG,
+                        "LISTENING_MODE update → ${
+                            controlCommand.value.joinToString(" ") { "%02X".format(it) }
+                        }"
                     )
                 }
 
@@ -637,8 +678,13 @@ class AACPManager {
 
     fun createRequestNotificationPacket(): ByteArray {
         val opcode = byteArrayOf(Opcodes.REQUEST_NOTIFICATIONS, 0x00)
-        val data = byteArrayOf(0xFF.toByte(), 0xFF.toByte(), 0xFF.toByte(), 0xFF.toByte())
-        // note to self #1: third byte is 0xfd when ear detection is disabled
+        // Must match Linux / Apple: 04 00 04 00 0F 00 FF FF FF FF FF (five 0xFF mask bytes).
+        // Four bytes left LISTENING_MODE (and other settings) unsubscribed — UI stayed on
+        // the last locally-written mode while AirPods/Mac changed freely.
+        val data = byteArrayOf(
+            0xFF.toByte(), 0xFF.toByte(), 0xFF.toByte(), 0xFF.toByte(), 0xFF.toByte()
+        )
+        // note to self #1: third mask byte is 0xfd when ear detection is disabled
         // note to self #2: this can be sent any time, not just at the start of the aacp connection
         return opcode + data
     }
@@ -871,18 +917,33 @@ class AACPManager {
         return opcode + buffer.array()
     }
 
+    /** Peer MAC for smart-routing / hijack — prefer CONNECTED_DEVICES, else audio-source. */
+    private fun peerMacAddresses(selfMacAddress: String): List<String> {
+        val fromList = connectedDevices.map { it.mac }.filter { it != selfMacAddress }
+        if (fromList.isNotEmpty()) return fromList.distinct()
+        val fromSource = audioSource?.mac
+        if (fromSource != null && fromSource != selfMacAddress) {
+            Log.d(TAG, "No CONNECTED_DEVICES peer — falling back to audio-source MAC $fromSource")
+            return listOf(fromSource)
+        }
+        return emptyList()
+    }
+
     fun sendHijackRequest(selfMacAddress: String): Boolean {
         if (selfMacAddress.length != 17 || !selfMacAddress.matches(Regex("([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}"))) {
             // throw IllegalArgumentException("MAC address must be 6 bytes")
             Log.w(TAG, "Invalid MAC address format, got: selfMacAddress=$selfMacAddress")
             return false
         }
+        val peers = peerMacAddresses(selfMacAddress)
+        if (peers.isEmpty()) {
+            Log.w(TAG, "Cannot send Hijack Request: no peer device MAC")
+            return false
+        }
         var success = false
-        for (connectedDevice in connectedDevices) {
-            if (connectedDevice.mac != selfMacAddress) {
-                Log.d(TAG, "Sending Hijack Request packet to ${connectedDevice.mac}")
-                success = sendDataPacket(createHijackRequestPacket(connectedDevice.mac)) || success
-            }
+        for (mac in peers) {
+            Log.d(TAG, "Sending Hijack Request packet to $mac")
+            success = sendDataPacket(createHijackRequestPacket(mac)) || success
         }
         return success
     }
@@ -921,12 +982,12 @@ class AACPManager {
             return false
         }
         Log.d(TAG, "SELFMAC: $selfMacAddress")
-        val targetMac = connectedDevices.find { it.mac != selfMacAddress }?.mac
+        val targetMac = peerMacAddresses(selfMacAddress).firstOrNull()
         if (targetMac == null) {
             Log.w(TAG, "Cannot send Media Information packet: No connected device found")
             return false
         }
-        Log.d(TAG, "Sending Media Information packet to $targetMac")
+        Log.d(TAG, "Sending Media Information packet to $targetMac (streaming=$streamingState)")
         return sendDataPacket(
             createMediaInformationPacket(
                 selfMacAddress, targetMac, streamingState
@@ -978,7 +1039,7 @@ class AACPManager {
             return false
         }
 
-        val targetMac = connectedDevices.find { it.mac != selfMacAddress }?.mac
+        val targetMac = peerMacAddresses(selfMacAddress).firstOrNull()
         if (targetMac == null) {
             Log.w(TAG, "Cannot send Smart Routing Show UI packet: No connected device found")
             return false
@@ -1123,14 +1184,19 @@ class AACPManager {
                 ) {
                     offset += 4
                 }
-                if (data.size - offset < 7) {
+                // Need at least 09 00 <id> [<value>...] — classic packets pad value to 4 bytes.
+                if (data.size - offset < 3) {
                     throw IllegalArgumentException("Too short for ControlCommand")
                 }
                 if (data[offset] != Opcodes.CONTROL_COMMAND) {
                     throw IllegalArgumentException("Invalid opcode")
                 }
                 val identifier = data[offset + 2]
-                val value = data.copyOfRange(offset + 3, offset + 7)
+                val value = when {
+                    data.size - offset >= 7 -> data.copyOfRange(offset + 3, offset + 7)
+                    data.size - offset > 3 -> data.copyOfRange(offset + 3, data.size)
+                    else -> byteArrayOf(0x00)
+                }
                 val trimmed = value.dropLastWhile { it == 0x00.toByte() }.toByteArray()
                 return ControlCommand(identifier, if (trimmed.isEmpty()) byteArrayOf(0x00) else trimmed)
             }

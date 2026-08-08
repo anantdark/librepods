@@ -53,6 +53,7 @@ import androidx.compose.material3.ToggleButton
 import androidx.compose.material3.ToggleButtonDefaults
 import androidx.compose.material3.VerticalDivider
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -241,12 +242,11 @@ fun NoiseControlSettings(
             }
 
 
-            // Only apply a real synced value (1–4). Unsynced 0 used to coerce to OFF, which
-            // then remapped to Transparency when Off mode is disabled — the wrong default.
-            if (noiseControlModeValue in 1..4) {
-                val index = noiseControlModeValue - 1
-                noiseControlMode.value = NoiseControlMode.entries[index]
-                onModeSelected(noiseControlMode.value, received = true)
+            // Sync from AirPods / ViewModel without side-effects during composition.
+            LaunchedEffect(noiseControlModeValue, showOffListeningMode) {
+                if (noiseControlModeValue !in 1..4) return@LaunchedEffect
+                val mode = NoiseControlMode.entries[noiseControlModeValue - 1]
+                onModeSelected(mode, received = true)
             }
 
             Box(

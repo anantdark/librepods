@@ -169,6 +169,9 @@ class GestureDetector(
         }
     }
 
+    /** True while the detector loop is armed (call ring or test screen). */
+    fun isDetecting(): Boolean = isRunning
+
     fun stopDetection(doNotStop: Boolean = false) {
         if (!isRunning) return
 

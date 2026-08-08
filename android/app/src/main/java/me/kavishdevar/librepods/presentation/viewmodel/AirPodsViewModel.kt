@@ -353,7 +353,9 @@ class AirPodsViewModel(
                             it.copy(
                                 isLocallyConnected = false,
                                 isNearby = service.bleManager.hasNearbyDevices(),
-                                battery = service.getBattery()
+                                battery = service.getBattery(),
+                                // AACP gone — noise control is not live; nearby is battery-only.
+                                controlStates = it.controlStates - ControlCommandIdentifiers.LISTENING_MODE
                             )
                         }
                     }
@@ -538,17 +540,29 @@ class AirPodsViewModel(
         if (isDemoMode) return
         service.let { service ->
             val aacpUp = BluetoothConnectionManager.aacpSocket?.isConnected == true
-            val liveMode = controlRepo.getValue(ControlCommandIdentifiers.LISTENING_MODE)
-                ?.getOrNull(0)?.toInt()?.takeIf { it in 1..4 }
-                ?: service.getANC().takeIf { it in 1..4 }
+            // Listening mode is live only while AACP is up. Nearby/BLE is battery-only.
+            val liveMode = if (aacpUp) {
+                controlRepo.getValue(ControlCommandIdentifiers.LISTENING_MODE)
+                    ?.getOrNull(0)?.toInt()?.takeIf { it in 1..4 }
+                    ?: service.getANC().takeIf { it in 1..4 }
+            } else {
+                null
+            }
             val persistedMode = sharedPreferences.getInt("last_listening_mode", 0)
                 .takeIf { it in 1..4 }
             val mode = liveMode ?: persistedMode ?: 0
-            val repoMap = controlRepo.getMap()
+            val repoMap = if (aacpUp) controlRepo.getMap() else emptyMap()
             _uiState.update { state ->
-                val mergedControls = state.controlStates + repoMap
-                val withMode = if (mode in 1..4) {
+                val mergedControls = if (aacpUp) {
+                    state.controlStates + repoMap
+                } else {
+                    // Drop stale live control map when only BLE-nearby (battery path).
+                    state.controlStates.filterKeys { it != ControlCommandIdentifiers.LISTENING_MODE }
+                }
+                val withMode = if (mode in 1..4 && aacpUp) {
                     mergedControls + (ControlCommandIdentifiers.LISTENING_MODE to byteArrayOf(mode.toByte()))
+                } else if (aacpUp) {
+                    mergedControls
                 } else {
                     mergedControls
                 }
@@ -556,7 +570,7 @@ class AirPodsViewModel(
                     isLocallyConnected = aacpUp,
                     isNearby = aacpUp || service.bleManager.hasNearbyDevices(),
                     battery = service.getBattery(),
-                    ancMode = mode,
+                    ancMode = if (aacpUp) mode else (persistedMode ?: 0),
                     controlStates = withMode
                 )
             }
