@@ -134,6 +134,10 @@ class AirPodsNotifications {
         const val DISCONNECT_RECEIVERS = "me.kavishdevar.librepods.DISCONNECT_RECEIVERS"
         const val EQ_DATA = "me.kavishdevar.librepods.HEADPHONE_ACCOMMODATION"
         const val AIRPODS_INFORMATION_UPDATED = "me.kavishdevar.librepods.AIRPODS_INFORMATION_UPDATED"
+        /** BLE proximity: AirPods in range (battery available without L2CAP). */
+        const val AIRPODS_NEARBY = "me.kavishdevar.librepods.AIRPODS_NEARBY"
+        /** BLE proximity lost — out of range / ads stopped. */
+        const val AIRPODS_GONE = "me.kavishdevar.librepods.AIRPODS_GONE"
     }
 
     class EarDetection {
@@ -222,16 +226,27 @@ class AirPodsNotifications {
         }
 
         fun setBatteryDirect(
-            leftLevel: Int,
+            leftLevel: Int?,
             leftCharging: Boolean,
-            rightLevel: Int,
+            rightLevel: Int?,
             rightCharging: Boolean,
-            caseLevel: Int,
+            caseLevel: Int?,
             caseCharging: Boolean
         ) {
-            first = Battery(BatteryComponent.LEFT, leftLevel, if (leftCharging) BatteryStatus.CHARGING else BatteryStatus.NOT_CHARGING)
-            second = Battery(BatteryComponent.RIGHT, rightLevel, if (rightCharging) BatteryStatus.CHARGING else BatteryStatus.NOT_CHARGING)
-            case = Battery(BatteryComponent.CASE, caseLevel, if (caseCharging) BatteryStatus.CHARGING else BatteryStatus.NOT_CHARGING)
+            fun status(level: Int?, charging: Boolean) = when {
+                level == null -> BatteryStatus.DISCONNECTED
+                charging -> BatteryStatus.CHARGING
+                else -> BatteryStatus.NOT_CHARGING
+            }
+            first = Battery(BatteryComponent.LEFT, leftLevel ?: 0, status(leftLevel, leftCharging))
+            second = Battery(BatteryComponent.RIGHT, rightLevel ?: 0, status(rightLevel, rightCharging))
+            case = Battery(BatteryComponent.CASE, caseLevel ?: 0, status(caseLevel, caseCharging))
+        }
+
+        fun clear() {
+            first = Battery(BatteryComponent.LEFT, 0, BatteryStatus.DISCONNECTED)
+            second = Battery(BatteryComponent.RIGHT, 0, BatteryStatus.DISCONNECTED)
+            case = Battery(BatteryComponent.CASE, 0, BatteryStatus.DISCONNECTED)
         }
 
         fun setBattery(data: ByteArray) {

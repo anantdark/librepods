@@ -30,6 +30,7 @@ import android.os.SystemClock
 import android.util.Log
 import android.view.KeyEvent
 import androidx.annotation.RequiresApi
+import me.kavishdevar.librepods.bluetooth.BluetoothConnectionManager
 import me.kavishdevar.librepods.services.ServiceManager
 import kotlin.io.encoding.ExperimentalEncodingApi
 
@@ -93,7 +94,28 @@ object MediaController {
 
         sharedPreferences.registerOnSharedPreferenceChangeListener(preferenceChangeListener)
 
-        audioManager.registerAudioPlaybackCallback(cb, null)
+        // Do not register playback callback here — AirPodsService enables it only when
+        // Bluetooth is on (exitBluetoothOffStandby / create-with-BT-on).
+    }
+
+    private var monitoringEnabled = false
+
+    /** Unregister playback callback when Bluetooth is off — no AirPods work possible. */
+    fun setMonitoringEnabled(enabled: Boolean) {
+        if (!this::audioManager.isInitialized) return
+        if (monitoringEnabled == enabled) return
+        monitoringEnabled = enabled
+        try {
+            if (enabled) {
+                audioManager.registerAudioPlaybackCallback(cb, null)
+                Log.d("MediaController", "Playback monitoring enabled")
+            } else {
+                audioManager.unregisterAudioPlaybackCallback(cb)
+                Log.d("MediaController", "Playback monitoring disabled (Bluetooth off standby)")
+            }
+        } catch (e: Exception) {
+            Log.w("MediaController", "Failed to toggle playback monitoring: ${e.message}")
+        }
     }
 
     val cb = object : AudioManager.AudioPlaybackCallback() {
@@ -102,6 +124,19 @@ object MediaController {
             super.onPlaybackConfigChanged(configs)
             val now = SystemClock.uptimeMillis()
             val isActive = audioManager.isMusicActive
+
+            // Standby: BT off, or no L2CAP and no BLE presence → skip takeover / AACP chatter.
+            val service = ServiceManager.getService()
+            if (service?.bluetoothOffStandby == true) {
+                lastKnownIsMusicActive = isActive
+                return
+            }
+            val aacpUp = BluetoothConnectionManager.aacpSocket?.isConnected == true
+            if (service != null && !aacpUp && !service.bleManager.hasNearbyDevices()) {
+                lastKnownIsMusicActive = isActive
+                return
+            }
+
             Log.d("MediaController", "Playback config changed, iPausedTheMedia: $iPausedTheMedia, isActive: $isActive, pausedForOtherDevice: $pausedForOtherDevice, lastKnownIsMusicActive: $lastKnownIsMusicActive")
 
             if (!isActive && lastPlayWithReplay && now - lastPlayTime < 2500L) {

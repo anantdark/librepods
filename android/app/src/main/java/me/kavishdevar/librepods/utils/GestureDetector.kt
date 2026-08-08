@@ -104,7 +104,7 @@ fun startDetection(doNotStop: Boolean = false, onGestureDetected: (Boolean) -> U
         isRunning = true
         gestureDetectedCallback = onGestureDetected
 
-        Log.d(TAG, "started: ${airPodsService.startHeadTracking()}")
+        Log.d(TAG, "started: ${airPodsService.startHeadTracking(allowOwnershipClaim = true)}")
 
         clearData()
 

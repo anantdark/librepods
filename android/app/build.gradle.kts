@@ -54,6 +54,8 @@ android {
     }
     buildTypes {
         release {
+            // Prefer fossRelease in Android Studio's Build Variants panel.
+            isDefault = true
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(
@@ -88,6 +90,7 @@ android {
     productFlavors {
         create("foss") {
             dimension = "env"
+            isDefault = true
             buildConfigField("Boolean", "PLAY_BUILD", "false")
         }
         create("play") {

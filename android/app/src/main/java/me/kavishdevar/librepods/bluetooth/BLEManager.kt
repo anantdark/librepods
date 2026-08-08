@@ -38,10 +38,23 @@ import kotlin.io.encoding.Base64
 import kotlin.io.encoding.ExperimentalEncodingApi
 
 /**
- * Manager for Bluetooth Low Energy scanning operations specifically for AirPods
+ * Manager for Bluetooth Low Energy scanning operations specifically for AirPods.
+ *
+ * Defaults to [ScanPowerMode.LOW_POWER] so standby (AirPods away / not connected) uses
+ * the least radio duty cycle Android allows. Escalates only while pods are nearby or
+ * the lid is open, then drops back automatically.
  */
 @OptIn(ExperimentalEncodingApi::class)
 class BLEManager(private val context: Context) {
+
+    enum class ScanPowerMode {
+        /** Standby: AirPods not nearby or AACP already connected. Minimal radio. */
+        LOW_POWER,
+        /** Nearby but not actively interacting (battery / takeover presence). */
+        BALANCED,
+        /** Short bursts: lid open / fresh discovery. Highest duty cycle. */
+        LOW_LATENCY
+    }
 
     data class AirPodsStatus(
         val address: String,
@@ -65,6 +78,8 @@ class BLEManager(private val context: Context) {
         return deviceStatusMap.values.maxByOrNull { it.lastSeen }
     }
 
+    fun hasNearbyDevices(): Boolean = deviceStatusMap.isNotEmpty()
+
     interface AirPodsStatusListener {
         fun onDeviceStatusChanged(device: AirPodsStatus, previousStatus: AirPodsStatus?)
         fun onBroadcastFromNewAddress(device: AirPodsStatus)
@@ -85,6 +100,14 @@ class BLEManager(private val context: Context) {
     private val processedAddresses = mutableSetOf<String>()
 
     private val lastValidCaseBatteryMap = mutableMapOf<String, Int>()
+    @Volatile private var isScanning = false
+    @Volatile private var currentPowerMode = ScanPowerMode.LOW_POWER
+    /** When true, prefer LOW_POWER even if pods are nearby (AACP already connected). */
+    @Volatile private var aacpConnectedHint = false
+    /** Adapter off — refuse all scan starts until [onBluetoothEnabled]. */
+    @Volatile private var bluetoothOffParked = false
+    private var scanFilter: ScanFilter? = null
+
     private val modelNames = mapOf(
         0x0E20 to "AirPods Pro",
         0x1420 to "AirPods Pro 2",
@@ -115,7 +138,14 @@ class BLEManager(private val context: Context) {
         override fun run() {
             cleanupStaleDevices()
             checkLidStateTimeout()
-            cleanupHandler.postDelayed(this, CLEANUP_INTERVAL_MS)
+            maybeAutoAdjustPowerMode()
+            cleanupHandler.postDelayed(this, cleanupIntervalFor(currentPowerMode))
+        }
+    }
+    private val lowLatencyExpiryRunnable = Runnable {
+        if (currentPowerMode == ScanPowerMode.LOW_LATENCY) {
+            Log.d(TAG, "LOW_LATENCY burst expired — dropping to adaptive mode")
+            applyAdaptivePowerMode()
         }
     }
 
@@ -123,10 +153,50 @@ class BLEManager(private val context: Context) {
         airPodsStatusListener = listener
     }
 
+    /**
+     * Hint from the service that AACP L2CAP is up.
+     * While connected: stop LE scanning entirely — avoids radio contention with
+     * L2CAP/A2DP (scan stop/start right after connect was causing disconnect loops).
+     * On disconnect: resume adaptive scan after a short settle delay.
+     */
+    fun setAacpConnected(connected: Boolean) {
+        if (aacpConnectedHint == connected) return
+        aacpConnectedHint = connected
+        Log.d(TAG, "AACP connected hint=$connected")
+        cleanupHandler.removeCallbacks(resumeAfterAacpRunnable)
+        if (connected) {
+            if (isScanning) {
+                Log.d(TAG, "AACP up — stopping BLE scan to avoid stack contention")
+                stopScanInternal(keepCleanup = false)
+                cleanupHandler.removeCallbacks(lowLatencyExpiryRunnable)
+            }
+        } else {
+            // Let ACL/A2DP settle before restarting LE; immediate restart fights reconnects.
+            cleanupHandler.postDelayed(resumeAfterAacpRunnable, RESUME_SCAN_AFTER_AACP_MS)
+        }
+    }
+
+    private val resumeAfterAacpRunnable = Runnable {
+        if (bluetoothOffParked || aacpConnectedHint) return@Runnable
+        val mode = desiredPowerMode()
+        Log.d(TAG, "Resuming BLE scan after AACP drop ($mode)")
+        startScanning(mode)
+    }
+
+    fun getScanPowerMode(): ScanPowerMode = currentPowerMode
+
     @SuppressLint("MissingPermission")
-    fun startScanning() {
+    fun startScanning(mode: ScanPowerMode = ScanPowerMode.LOW_POWER) {
         try {
-            Log.d(TAG, "Starting BLE scanner")
+            if (bluetoothOffParked) {
+                Log.d(TAG, "Skipping BLE start — Bluetooth off (parked)")
+                return
+            }
+            if (aacpConnectedHint) {
+                Log.d(TAG, "Skipping BLE start — AACP connected (scan parked)")
+                return
+            }
+            Log.d(TAG, "Starting BLE scanner in $mode")
 
             val btManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
             val btAdapter = btManager.adapter
@@ -136,38 +206,25 @@ class BLEManager(private val context: Context) {
                 return
             }
 
-            if (mBluetoothLeScanner != null && mScanCallback != null) {
-                mBluetoothLeScanner?.stopScan(mScanCallback)
-                mScanCallback = null
-            }
-
             if (!btAdapter.isEnabled) {
                 Log.d(TAG, "Bluetooth is disabled")
+                bluetoothOffParked = true
                 return
             }
 
+            if (isScanning && mScanCallback != null && currentPowerMode == mode) {
+                Log.d(TAG, "BLE scanner already running in $mode")
+                return
+            }
+
+            stopScanInternal(keepCleanup = false)
+
             mBluetoothLeScanner = btAdapter.bluetoothLeScanner
+            currentPowerMode = mode
 
-            val scanSettings = ScanSettings.Builder()
-                .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
-                .setMatchMode(ScanSettings.MATCH_MODE_AGGRESSIVE)
-                .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
-                .setNumOfMatches(ScanSettings.MATCH_NUM_MAX_ADVERTISEMENT)
-                .setReportDelay(500L)
-                .build()
-
-            val manufacturerData = ByteArray(27)
-            val manufacturerDataMask = ByteArray(27)
-
-            manufacturerData[0] = 7
-            manufacturerData[1] = 25
-
-            manufacturerDataMask[0] = -1
-            manufacturerDataMask[1] = -1
-
-            val scanFilter = ScanFilter.Builder()
-                .setManufacturerData(76, manufacturerData, manufacturerDataMask)
-                .build()
+            if (scanFilter == null) {
+                scanFilter = buildAirPodsScanFilter()
+            }
 
             mScanCallback = object : ScanCallback() {
                 override fun onScanResult(callbackType: Int, result: ScanResult) {
@@ -183,30 +240,184 @@ class BLEManager(private val context: Context) {
 
                 override fun onScanFailed(errorCode: Int) {
                     Log.e(TAG, "BLE scan failed with error code: $errorCode")
+                    isScanning = false
                 }
             }
 
-            mBluetoothLeScanner?.startScan(listOf(scanFilter), scanSettings, mScanCallback)
-            Log.d(TAG, "BLE scanner started successfully")
+            mBluetoothLeScanner?.startScan(
+                listOf(scanFilter),
+                buildScanSettings(mode),
+                mScanCallback
+            )
+            isScanning = true
+            Log.d(TAG, "BLE scanner started successfully ($mode)")
 
-            cleanupHandler.postDelayed(cleanupRunnable, CLEANUP_INTERVAL_MS)
+            cleanupHandler.removeCallbacks(cleanupRunnable)
+            cleanupHandler.postDelayed(cleanupRunnable, cleanupIntervalFor(mode))
         } catch (t: Throwable) {
             Log.e(TAG, "Error starting BLE scanner", t)
+            isScanning = false
+        }
+    }
+
+    /**
+     * Restart the scan with a new power mode if different from the current one.
+     * No-op when not currently scanning.
+     */
+    fun setScanPowerMode(mode: ScanPowerMode) {
+        if (bluetoothOffParked) return
+        if (!isScanning) {
+            currentPowerMode = mode
+            return
+        }
+        if (currentPowerMode == mode) return
+        Log.d(TAG, "Switching BLE scan power $currentPowerMode → $mode")
+        startScanning(mode)
+        if (mode == ScanPowerMode.LOW_LATENCY) {
+            cleanupHandler.removeCallbacks(lowLatencyExpiryRunnable)
+            cleanupHandler.postDelayed(lowLatencyExpiryRunnable, LOW_LATENCY_BURST_MS)
+        } else {
+            cleanupHandler.removeCallbacks(lowLatencyExpiryRunnable)
         }
     }
 
     @SuppressLint("MissingPermission")
     fun stopScanning() {
         try {
-            if (mBluetoothLeScanner != null && mScanCallback != null) {
-                Log.d(TAG, "Stopping BLE scanner")
-                mBluetoothLeScanner?.stopScan(mScanCallback)
-                mScanCallback = null
-            }
-
-            cleanupHandler.removeCallbacks(cleanupRunnable)
+            Log.d(TAG, "Stopping BLE scanner")
+            cleanupHandler.removeCallbacks(resumeAfterAacpRunnable)
+            stopScanInternal(keepCleanup = false)
+            cleanupHandler.removeCallbacks(lowLatencyExpiryRunnable)
+            aacpConnectedHint = false
+            currentPowerMode = ScanPowerMode.LOW_POWER
         } catch (t: Throwable) {
             Log.e(TAG, "Error stopping BLE scanner", t)
+        }
+    }
+
+    /**
+     * Bluetooth radio off — stop all LE work and drop tracked presence so the service
+     * holds almost no background cost until the adapter is enabled again.
+     */
+    fun onBluetoothDisabled() {
+        Log.d(TAG, "Bluetooth disabled — parking BLE manager")
+        bluetoothOffParked = true
+        cleanupHandler.removeCallbacks(resumeAfterAacpRunnable)
+        cleanupHandler.removeCallbacks(lowLatencyExpiryRunnable)
+        cleanupHandler.removeCallbacks(cleanupRunnable)
+        stopScanning()
+        deviceStatusMap.clear()
+        processedAddresses.clear()
+        verifiedAddresses.clear()
+        currentGlobalLidState = null
+        lastBroadcastTime = 0
+        airPodsStatusListener?.onDeviceDisappeared()
+    }
+
+    /** Adapter on again — allow [startScanning] (caller starts the scan). */
+    fun onBluetoothEnabled() {
+        bluetoothOffParked = false
+        Log.d(TAG, "Bluetooth enabled — BLE manager unparked")
+    }
+
+    fun isBluetoothOffParked(): Boolean = bluetoothOffParked
+
+    fun isScanning(): Boolean = isScanning
+
+    @SuppressLint("MissingPermission")
+    private fun stopScanInternal(keepCleanup: Boolean) {
+        if (mBluetoothLeScanner != null && mScanCallback != null) {
+            try {
+                mBluetoothLeScanner?.stopScan(mScanCallback)
+            } catch (t: Throwable) {
+                Log.w(TAG, "stopScan failed", t)
+            }
+            mScanCallback = null
+        }
+        isScanning = false
+        if (!keepCleanup) {
+            cleanupHandler.removeCallbacks(cleanupRunnable)
+        }
+    }
+
+    private fun buildAirPodsScanFilter(): ScanFilter {
+        val manufacturerData = ByteArray(27)
+        val manufacturerDataMask = ByteArray(27)
+        manufacturerData[0] = 7
+        manufacturerData[1] = 25
+        manufacturerDataMask[0] = -1
+        manufacturerDataMask[1] = -1
+        return ScanFilter.Builder()
+            .setManufacturerData(76, manufacturerData, manufacturerDataMask)
+            .build()
+    }
+
+    private fun buildScanSettings(mode: ScanPowerMode): ScanSettings {
+        val builder = ScanSettings.Builder()
+            .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
+        when (mode) {
+            ScanPowerMode.LOW_POWER -> {
+                builder
+                    .setScanMode(ScanSettings.SCAN_MODE_LOW_POWER)
+                    .setMatchMode(ScanSettings.MATCH_MODE_STICKY)
+                    .setNumOfMatches(ScanSettings.MATCH_NUM_FEW_ADVERTISEMENT)
+                    .setReportDelay(2000L)
+            }
+            ScanPowerMode.BALANCED -> {
+                builder
+                    .setScanMode(ScanSettings.SCAN_MODE_BALANCED)
+                    .setMatchMode(ScanSettings.MATCH_MODE_STICKY)
+                    .setNumOfMatches(ScanSettings.MATCH_NUM_FEW_ADVERTISEMENT)
+                    .setReportDelay(1000L)
+            }
+            ScanPowerMode.LOW_LATENCY -> {
+                builder
+                    .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+                    .setMatchMode(ScanSettings.MATCH_MODE_AGGRESSIVE)
+                    .setNumOfMatches(ScanSettings.MATCH_NUM_MAX_ADVERTISEMENT)
+                    .setReportDelay(500L)
+            }
+        }
+        return builder.build()
+    }
+
+    private fun cleanupIntervalFor(mode: ScanPowerMode): Long = when (mode) {
+        ScanPowerMode.LOW_POWER -> CLEANUP_INTERVAL_LOW_POWER_MS
+        ScanPowerMode.BALANCED -> CLEANUP_INTERVAL_BALANCED_MS
+        ScanPowerMode.LOW_LATENCY -> CLEANUP_INTERVAL_LOW_LATENCY_MS
+    }
+
+    private fun desiredPowerMode(): ScanPowerMode {
+        // AACP-connected scanning is handled by setAacpConnected (scan fully stopped).
+        if (currentGlobalLidState == true) return ScanPowerMode.LOW_LATENCY
+        if (deviceStatusMap.isNotEmpty()) return ScanPowerMode.BALANCED
+        return ScanPowerMode.LOW_POWER
+    }
+
+    private fun applyAdaptivePowerMode() {
+        // Never stop/restart the scanner from inside a ScanCallback — post to main.
+        cleanupHandler.post {
+            if (aacpConnectedHint || !isScanning) return@post
+            val desired = desiredPowerMode()
+            // Don't cut a LOW_LATENCY burst short unless devices vanished → LOW_POWER.
+            if (currentPowerMode == ScanPowerMode.LOW_LATENCY &&
+                desired != ScanPowerMode.LOW_POWER &&
+                cleanupHandler.hasCallbacks(lowLatencyExpiryRunnable)
+            ) {
+                return@post
+            }
+            if (desired != currentPowerMode) {
+                setScanPowerMode(desired)
+            }
+        }
+    }
+
+    private fun maybeAutoAdjustPowerMode() {
+        if (aacpConnectedHint || !isScanning) return
+        val desired = desiredPowerMode()
+        if (desired != currentPowerMode) {
+            Log.d(TAG, "Auto-adjust scan power $currentPowerMode → $desired")
+            setScanPowerMode(desired)
         }
     }
 
@@ -282,6 +493,7 @@ class BLEManager(private val context: Context) {
             }
 
             val previousStatus = deviceStatusMap[address]
+            val wasEmpty = deviceStatusMap.isEmpty()
             deviceStatusMap[address] = parsedStatus
 
             airPodsStatusListener?.let { listener ->
@@ -326,6 +538,11 @@ class BLEManager(private val context: Context) {
                         Log.d(TAG, "Battery changed - Left: ${parsedStatus.leftBattery}, Right: ${parsedStatus.rightBattery}, Case: ${parsedStatus.caseBattery}")
                     }
                 }
+            }
+
+            // Escalate once pods appear or lid opens; stay low-power while AACP is up.
+            if (wasEmpty || currentGlobalLidState == true) {
+                applyAdaptivePowerMode()
             }
         } catch (t: Throwable) {
             Log.e(TAG, "Error processing scan result", t)
@@ -403,6 +620,7 @@ class BLEManager(private val context: Context) {
 
         if (hadDevices && deviceStatusMap.isEmpty()) {
             airPodsStatusListener?.onDeviceDisappeared()
+            applyAdaptivePowerMode()
         }
     }
 
@@ -412,6 +630,8 @@ class BLEManager(private val context: Context) {
             Log.d(TAG, "No broadcasts for ${LID_CLOSE_TIMEOUT_MS}ms, forcing lid state to closed")
             currentGlobalLidState = false
             airPodsStatusListener?.onLidStateChanged(false)
+            // Lid-driven LOW_LATENCY no longer needed.
+            applyAdaptivePowerMode()
         }
     }
 
@@ -491,8 +711,14 @@ class BLEManager(private val context: Context) {
 
     companion object {
         private const val TAG = "AirPodsBLE"
-        private const val CLEANUP_INTERVAL_MS = 10000L
+        private const val CLEANUP_INTERVAL_LOW_POWER_MS = 30000L
+        private const val CLEANUP_INTERVAL_BALANCED_MS = 15000L
+        private const val CLEANUP_INTERVAL_LOW_LATENCY_MS = 10000L
         private const val STALE_DEVICE_TIMEOUT_MS = 15000L
         private const val LID_CLOSE_TIMEOUT_MS = 2500L
+        /** Cap aggressive scanning after lid-open / discovery bursts. */
+        private const val LOW_LATENCY_BURST_MS = 15_000L
+        /** Delay LE resume after L2CAP drop so ACL/A2DP can settle. */
+        private const val RESUME_SCAN_AFTER_AACP_MS = 2_500L
     }
 }

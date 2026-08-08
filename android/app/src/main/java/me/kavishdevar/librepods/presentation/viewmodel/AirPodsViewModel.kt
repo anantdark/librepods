@@ -61,6 +61,8 @@ data class AirPodsUiState(
     val deviceName: String = "AirPods",
 
     val isLocallyConnected: Boolean = false,
+    /** BLE proximity — battery available without AACP (like macOS menu-bar battery). */
+    val isNearby: Boolean = false,
 
     val instance: AirPodsInstance? = null,
     val capabilities: Set<Capability> = emptySet(),
@@ -326,19 +328,44 @@ class AirPodsViewModel(
                 if (!isDemoMode) when (action) {
                     AirPodsNotifications.AIRPODS_L2CAP_CONNECTED -> {
                         _uiState.update {
-                            it.copy(isLocallyConnected = true)
+                            it.copy(isLocallyConnected = true, isNearby = true)
                         }
                     }
 
                     AirPodsNotifications.AIRPODS_DISCONNECTED -> {
                         _uiState.update {
-                            it.copy(isLocallyConnected = false)
+                            it.copy(
+                                isLocallyConnected = false,
+                                isNearby = service.bleManager.hasNearbyDevices(),
+                                battery = service.getBattery()
+                            )
+                        }
+                    }
+
+                    AirPodsNotifications.AIRPODS_NEARBY -> {
+                        _uiState.update {
+                            it.copy(
+                                isNearby = true,
+                                battery = service.getBattery()
+                            )
+                        }
+                    }
+
+                    AirPodsNotifications.AIRPODS_GONE -> {
+                        _uiState.update {
+                            it.copy(
+                                isNearby = false,
+                                battery = if (it.isLocallyConnected) it.battery else emptyList()
+                            )
                         }
                     }
 
                     AirPodsNotifications.BATTERY_DATA -> {
                         _uiState.update {
-                            it.copy(battery = service.getBattery())
+                            it.copy(
+                                battery = service.getBattery(),
+                                isNearby = it.isLocallyConnected || service.bleManager.hasNearbyDevices()
+                            )
                         }
                     }
 
@@ -360,6 +387,8 @@ class AirPodsViewModel(
         val filter = IntentFilter().apply {
             addAction(AirPodsNotifications.AIRPODS_CONNECTED)
             addAction(AirPodsNotifications.AIRPODS_DISCONNECTED)
+            addAction(AirPodsNotifications.AIRPODS_NEARBY)
+            addAction(AirPodsNotifications.AIRPODS_GONE)
             addAction(AirPodsNotifications.BATTERY_DATA)
             addAction(AirPodsNotifications.EQ_DATA)
             addAction(AirPodsNotifications.AIRPODS_INFORMATION_UPDATED)
@@ -465,9 +494,11 @@ class AirPodsViewModel(
     fun loadCurrentStatus() {
         if (isDemoMode) return
         service.let { service ->
+            val aacpUp = BluetoothConnectionManager.aacpSocket?.isConnected == true
             _uiState.update {
                 it.copy(
-                    isLocallyConnected = BluetoothConnectionManager.aacpSocket?.isConnected == true,
+                    isLocallyConnected = aacpUp,
+                    isNearby = aacpUp || service.bleManager.hasNearbyDevices(),
                     battery = service.getBattery(),
                     ancMode = controlRepo.getValue(ControlCommandIdentifiers.LISTENING_MODE)?.get(0)?.toInt() ?: 1,
                     controlStates = controlRepo.getMap()
@@ -638,7 +669,8 @@ class AirPodsViewModel(
     }
 
     fun startHeadTracking() {
-        service.startHeadTracking()
+        // UI / explicit user action — claiming ownership is OK here.
+        service.startHeadTracking(allowOwnershipClaim = true)
         _uiState.update { it.copy(headTrackingActive = true) }
     }
 

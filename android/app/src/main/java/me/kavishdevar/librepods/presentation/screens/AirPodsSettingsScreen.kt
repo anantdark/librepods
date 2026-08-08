@@ -103,6 +103,7 @@ import me.kavishdevar.librepods.R
 import me.kavishdevar.librepods.bluetooth.AACPManager
 import me.kavishdevar.librepods.bluetooth.ATTHandles
 import me.kavishdevar.librepods.data.AirPodsPro3
+import me.kavishdevar.librepods.data.BatteryStatus
 import me.kavishdevar.librepods.data.Capability
 import me.kavishdevar.librepods.presentation.MaterialIcons
 import me.kavishdevar.librepods.presentation.components.AboutCard
@@ -654,6 +655,10 @@ fun AirPodsSettingsScreen(
                 }
             }
 
+            val showNearbyBattery = state.isNearby && state.battery.any {
+                it.status != BatteryStatus.DISCONNECTED
+            }
+
             when (LocalDesignSystem.current) {
                 DesignSystem.Material -> {
                     val polygons = remember {
@@ -746,6 +751,17 @@ fun AirPodsSettingsScreen(
                                 },
                             horizontalAlignment = Alignment.CenterHorizontally
                         ) {
+                            if (showNearbyBattery) {
+                                BatteryView(
+                                    batteryList = state.battery,
+                                    budsRes = state.instance?.model?.budsRes
+                                        ?: R.drawable.airpods_pro_2_buds,
+                                    caseRes = state.instance?.model?.caseRes
+                                        ?: R.drawable.airpods_pro_2_case
+                                )
+                                Spacer(modifier = Modifier.height(24.dp))
+                            }
+
                             val primaryContainerColor = MaterialTheme.colorScheme.tertiaryContainer
                             val secondaryContainerColor = MaterialTheme.colorScheme.secondaryContainer
 
@@ -866,6 +882,16 @@ fun AirPodsSettingsScreen(
                         modifier = Modifier.fillMaxWidth(),
                         verticalArrangement = Arrangement.Center
                     ) {
+                        if (showNearbyBattery) {
+                            BatteryView(
+                                batteryList = state.battery,
+                                budsRes = state.instance?.model?.budsRes
+                                    ?: R.drawable.airpods_pro_2_buds,
+                                caseRes = state.instance?.model?.caseRes
+                                    ?: R.drawable.airpods_pro_2_case
+                            )
+                            Spacer(modifier = Modifier.height(24.dp))
+                        }
                         Column(
                             modifier = Modifier
                                 .fillMaxWidth()
