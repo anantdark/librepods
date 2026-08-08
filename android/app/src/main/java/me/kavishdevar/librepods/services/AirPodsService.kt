@@ -213,6 +213,8 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
     @Volatile private var callTakeOverIslandShown: Boolean = false
     /** True once Hijackv2 was actually sent to a peer MAC this call (Mac should pause). */
     @Volatile private var callHijackSucceeded: Boolean = false
+    /** Debounce staggered call-hijack launches (audio-source spam is ~15Hz). */
+    @Volatile private var lastCallHijackLaunchMs: Long = 0L
     /** Periodic AACP notification refresh so Mac→app listening-mode changes land. */
     @Volatile private var listeningModeSyncJob: Job? = null
     /** Keeps AACP primary while linked (idle or playing). AirPods drop secondary links ~45s. */
@@ -565,6 +567,7 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
                         lastCallTakeOverMs = 0L
                         callHijackSucceeded = false
                         callTakeOverIslandShown = false
+                        lastCallHijackLaunchMs = 0L
                         // Ownership coordinator: HFP first, then existing call takeOver path.
                         audioOwnership.onCallState(TelephonyManager.CALL_STATE_RINGING)
                         enableStemCaptureForIncomingCall()
@@ -1046,8 +1049,9 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
     }
 
     /**
-     * Full OWNS + media + ShowUI + Hijackv2 so Mac pauses. Returns true when Hijackv2
-     * was sent to at least one peer MAC.
+     * Full OWNS → media(PhoneCall) → ShowUI → Hijackv2 so MacBook pauses.
+     * Packets are staggered — blasting them in one tick was ignored by macOS.
+     * Returns true when a staggered claim was launched (or recently succeeded).
      */
     private fun sendCallHijackPackets(reason: String): Boolean {
         if (!isRinging && !isInCall) return false
@@ -1055,39 +1059,68 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
         if (BluetoothConnectionManager.aacpSocket?.isConnected != true) return false
         if (localMac.isEmpty()) return false
 
-        aacpManager.sendControlCommand(
-            AACPManager.Companion.ControlCommandIdentifiers.OWNS_CONNECTION.value,
-            1
-        )
-        val mediaSent = aacpManager.sendMediaInformataion(localMac, streamingState = true)
-        val uiSent = aacpManager.sendSmartRoutingShowUI(localMac)
-        val hijackSent = aacpManager.sendHijackRequest(localMac)
-        Log.d(
-            TAG,
-            "Call hijack ($reason): media=$mediaSent showUI=$uiSent hijack=$hijackSent " +
-                "peers=${aacpManager.connectedDevices.size} " +
-                "audioSrc=${aacpManager.audioSource?.mac}"
-        )
-        if (hijackSent) {
-            callHijackSucceeded = true
-            otherDeviceTookOver = false
-            if (::audioOwnership.isInitialized) {
-                audioOwnership.onHardClaimIssued("call")
-            }
-        } else {
-            // Failed claim must not burn the takeOver debounce window.
-            lastCallTakeOverMs = 0L
+        val now = System.currentTimeMillis()
+        // Allow one in-flight staggered sequence ~every 1.2s (audio-source is ~15Hz).
+        if (now - lastCallHijackLaunchMs < 1_200L) {
+            return callHijackSucceeded
         }
-        return hijackSent
+        lastCallHijackLaunchMs = now
+
+        CoroutineScope(Dispatchers.IO).launch {
+            if (!isRinging && !isInCall) return@launch
+            if (BluetoothConnectionManager.aacpSocket?.isConnected != true) return@launch
+
+            aacpManager.sendControlCommand(
+                AACPManager.Companion.ControlCommandIdentifiers.OWNS_CONNECTION.value,
+                1
+            )
+            delay(80)
+            if (!isRinging && !isInCall) return@launch
+            val mediaSent = aacpManager.sendMediaInformataion(
+                localMac, streamingState = true, forCall = true
+            )
+            delay(80)
+            if (!isRinging && !isInCall) return@launch
+            val uiSent = aacpManager.sendSmartRoutingShowUI(localMac)
+            delay(80)
+            if (!isRinging && !isInCall) return@launch
+            val hijackSent = aacpManager.sendHijackRequest(localMac, forCall = true)
+            Log.d(
+                TAG,
+                "Call hijack ($reason): media=$mediaSent showUI=$uiSent hijack=$hijackSent " +
+                    "peers=${aacpManager.connectedDevices.size} " +
+                    "audioSrc=${aacpManager.audioSource?.mac}"
+            )
+            if (hijackSent) {
+                callHijackSucceeded = true
+                otherDeviceTookOver = false
+                lastCallTakeOverMs = System.currentTimeMillis()
+                if (::audioOwnership.isInitialized) {
+                    audioOwnership.onHardClaimIssued("call")
+                }
+                // Second nudge — MacBook often needs a follow-up after A2DP/SCO settles.
+                delay(500)
+                if ((isRinging || isInCall) &&
+                    BluetoothConnectionManager.aacpSocket?.isConnected == true
+                ) {
+                    aacpManager.sendSmartRoutingShowUI(localMac)
+                    delay(50)
+                    aacpManager.sendHijackRequest(localMac, forCall = true)
+                    Log.d(TAG, "Call hijack ($reason): follow-up ShowUI+Hijackv2 sent")
+                }
+            } else {
+                lastCallTakeOverMs = 0L
+                lastCallHijackLaunchMs = 0L
+            }
+        }
+        return true
     }
 
     /** When peer MAC / Mac MEDIA appears mid-ring, claim immediately (don't wait for retry tick). */
     private fun maybeHijackForActiveCall(reason: String) {
         if (!isRinging && !isInCall) return
         if (callHijackSucceeded && !otherDeviceIsAudioSource()) return
-        if (sendCallHijackPackets(reason)) {
-            Log.d(TAG, "Call hijack succeeded on $reason — Mac should pause")
-        }
+        sendCallHijackPackets(reason)
     }
 
     /**
@@ -1133,9 +1166,11 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
                 val htLive = validHeadTrackingSamples > 0
                 val macStillMedia = otherDeviceIsAudioSource()
 
-                // Keep retrying until Hijackv2 actually reached a peer (or Mac left MEDIA).
-                // Stopping on AACP-up alone left Mac playing when early hijacks had no peer MAC.
-                if (aacpUp && callHijackSucceeded && !macStillMedia) {
+                val macPeerLinked = aacpManager.connectedDevices.any { it.mac != localMac }
+                // While MacBook is still linked, give Hijack a few staggered rounds to pause it.
+                if (aacpUp && callHijackSucceeded && !macStillMedia &&
+                    (!macPeerLinked || attempt >= 3)
+                ) {
                     if (isInCall) {
                         Log.d(TAG, "In-call hijack done — stop connect/takeOver retry")
                         break
@@ -1145,12 +1180,7 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
                         break
                     }
                 }
-                // No Mac peer after several tries — don't spin forever on a solo phone.
-                if (aacpUp && !macStillMedia && attempt >= 8 && callHijackSucceeded) {
-                    Log.d(TAG, "Call path ready after $attempt attempts — stop retry")
-                    break
-                }
-                if (isInCall && attempt >= 12) {
+                if (isInCall && attempt >= 8) {
                     Log.d(TAG, "In-call after $attempt nudges — stop retry")
                     break
                 }

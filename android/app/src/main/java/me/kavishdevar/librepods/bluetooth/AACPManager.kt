@@ -951,7 +951,7 @@ class AACPManager {
         return emptyList()
     }
 
-    fun sendHijackRequest(selfMacAddress: String): Boolean {
+    fun sendHijackRequest(selfMacAddress: String, forCall: Boolean = false): Boolean {
         if (selfMacAddress.length != 17 || !selfMacAddress.matches(Regex("([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}"))) {
             // throw IllegalArgumentException("MAC address must be 6 bytes")
             Log.w(TAG, "Invalid MAC address format, got: selfMacAddress=$selfMacAddress")
@@ -964,15 +964,15 @@ class AACPManager {
         }
         var success = false
         for (mac in peers) {
-            Log.d(TAG, "Sending Hijack Request packet to $mac")
-            success = sendDataPacket(createHijackRequestPacket(mac)) || success
+            Log.d(TAG, "Sending Hijack Request packet to $mac (forCall=$forCall)")
+            success = sendDataPacket(createHijackRequestPacket(mac, forCall)) || success
         }
         return success
     }
 
-    fun createHijackRequestPacket(targetMacAddress: String): ByteArray {
+    fun createHijackRequestPacket(targetMacAddress: String, forCall: Boolean = false): ByteArray {
         val opcode = byteArrayOf(Opcodes.SMART_ROUTING, 0x00)
-        val buffer = ByteBuffer.allocate(106)
+        val buffer = ByteBuffer.allocate(108)
         buffer.put(
             targetMacAddress.split(":").map { it.toInt(16).toByte() }.toByteArray().reversedArray()
         )
@@ -980,7 +980,12 @@ class AACPManager {
         buffer.put(byteArrayOf(0x01, 0xE5.toByte()))
         buffer.put(0x4A)
         buffer.put("localscore".toByteArray())
-        buffer.put(byteArrayOf(0x30, 0x64))
+        // Call must outrank MacBook media — prior remotescore 0xA5 looked higher than local 0x64.
+        if (forCall) {
+            buffer.put(byteArrayOf(0x31, 0x2D, 0x01)) // same high local score as ShowUI
+        } else {
+            buffer.put(byteArrayOf(0x30, 0x64))
+        }
         buffer.put(0x46)
         buffer.put("reason".toByteArray())
         buffer.put(0x48)
@@ -992,12 +997,20 @@ class AACPManager {
         buffer.put(0x01)
         buffer.put(0x4B)
         buffer.put("remotescore".toByteArray())
-        buffer.put(0xA5.toByte())
+        buffer.put(if (forCall) 0x10.toByte() else 0xA5.toByte())
 
         return opcode + buffer.array()
     }
 
-    fun sendMediaInformataion(selfMacAddress: String, streamingState: Boolean = false): Boolean {
+    /**
+     * @param forCall When true, advertise Phone/telephony so MacBook Continuity pauses media
+     * for an incoming call (YouTube category does not outrank Mac music the same way).
+     */
+    fun sendMediaInformataion(
+        selfMacAddress: String,
+        streamingState: Boolean = false,
+        forCall: Boolean = false
+    ): Boolean {
         if (selfMacAddress.length != 17 || !selfMacAddress.matches(Regex("([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}"))) {
             // throw IllegalArgumentException("MAC address must be 6 bytes")
             Log.d(TAG, "Invalid MAC address format, got: selfMacAddress=$selfMacAddress")
@@ -1009,18 +1022,27 @@ class AACPManager {
             Log.w(TAG, "Cannot send Media Information packet: No connected device found")
             return false
         }
-        Log.d(TAG, "Sending Media Information packet to $targetMac (streaming=$streamingState)")
+        Log.d(
+            TAG,
+            "Sending Media Information packet to $targetMac (streaming=$streamingState forCall=$forCall)"
+        )
         return sendDataPacket(
             createMediaInformationPacket(
-                selfMacAddress, targetMac, streamingState
+                selfMacAddress, targetMac, streamingState, forCall
             )
         )
     }
 
     fun createMediaInformationPacket(
-        selfMacAddress: String, targetMacAddress: String, streamingState: Boolean = true
+        selfMacAddress: String,
+        targetMacAddress: String,
+        streamingState: Boolean = true,
+        forCall: Boolean = false
     ): ByteArray {
         val opcode = byteArrayOf(Opcodes.SMART_ROUTING, 0x00)
+        // Keep 22-char PlayingApp so the 0x56 length tag / 0x82 payload size stay valid.
+        val playingApp =
+            if (forCall) "com.apple.PhoneCallApp" else "com.google.ios.youtube"
         val buffer = ByteBuffer.allocate(138)
         buffer.put(
             targetMacAddress.split(":").map { it.toInt(16).toByte() }.toByteArray().reversedArray()
@@ -1033,8 +1055,8 @@ class AACPManager {
         )
         buffer.put(byteArrayOf(0x01, 0xE5.toByte(), 0x4A)) // unknown, constant
         buffer.put("PlayingApp".toByteArray())
-        buffer.put(byteArrayOf(0x56)) // 'V', seems like an identifier or a separator
-        buffer.put("com.google.ios.youtube".toByteArray()) // package name, hardcoding for now, aforementioned reason
+        buffer.put(byteArrayOf(0x56)) // ASCII string len 22
+        buffer.put(playingApp.toByteArray())
         buffer.put(byteArrayOf(0x52)) // 'R'
         buffer.put("HostStreamingState".toByteArray())
         buffer.put(byteArrayOf(0x42)) // 'B'
@@ -1049,7 +1071,12 @@ class AACPManager {
         buffer.put(0x58) // 'X'
         buffer.put("otherDevice".toByteArray())
         buffer.put("AudioCategory".toByteArray())
-        buffer.put(byteArrayOf(0x31, 0x2D, 0x01))
+        // Call: high telephony-style score so MacBook yields; media keeps prior wildcard.
+        if (forCall) {
+            buffer.put(byteArrayOf(0x30, 0x64)) // "0d" / 100 — matches new-device call-ish category
+        } else {
+            buffer.put(byteArrayOf(0x31, 0x2D, 0x01))
+        }
 
         return opcode + buffer.array()
     }
@@ -1072,11 +1099,14 @@ class AACPManager {
 
     fun createSmartRoutingShowUIPacket(targetMacAddress: String): ByteArray {
         val opcode = byteArrayOf(Opcodes.SMART_ROUTING, 0x00)
-        val buffer = ByteBuffer.allocate(134)
+        // Same TLV layout as Hijackv2: reason (len 6) + Hijackv2 (len 8).
+        // Old "reasonHhijackv2" mashed the tags — MacBook ignored ShowUI / often didn't pause.
+        val buffer = ByteBuffer.allocate(136)
         buffer.put(
             targetMacAddress.split(":").map { it.toInt(16).toByte() }.toByteArray().reversedArray()
         )
-        buffer.put(byteArrayOf(0x7E, 0x00))
+        // +1 vs old malformed "reasonHhijackv2" blob (proper reason + Hijackv2 TLVs).
+        buffer.put(byteArrayOf(0x7F, 0x00))
         buffer.put(byteArrayOf(0x01, 0xE6.toByte(), 0x5B))
         buffer.put("SmartRoutingKeyShowNearbyUI".toByteArray())
         buffer.put(0x01) // separator?
@@ -1085,7 +1115,9 @@ class AACPManager {
         buffer.put(0x31, 0x2D)
         buffer.put(0x01)
         buffer.put(0x46)
-        buffer.put("reasonHhijackv2".toByteArray())
+        buffer.put("reason".toByteArray())
+        buffer.put(0x48)
+        buffer.put("Hijackv2".toByteArray())
         buffer.put(0x51.toByte())
         buffer.put("audioRoutingScore".toByteArray())
         buffer.put(0xA2.toByte())
