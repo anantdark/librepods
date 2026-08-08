@@ -191,6 +191,14 @@ class AACPManager {
     var connectedDevices: List<ConnectedDevice> = listOf()
         private set
 
+    /**
+     * Survives AACP reconnect clears. Hijack/media packets need a peer MAC immediately on
+     * ring; CONNECTED_DEVICES / audio-source often arrive ~1–2s later — without this cache
+     * the first claim fails with "no peer device MAC" and Mac keeps playing.
+     */
+    @Volatile
+    private var cachedPeerMacs: List<String> = emptyList()
+
     var audioSource: AudioSource? = null
         private set
 
@@ -917,14 +925,28 @@ class AACPManager {
         return opcode + buffer.array()
     }
 
-    /** Peer MAC for smart-routing / hijack — prefer CONNECTED_DEVICES, else audio-source. */
+    /** Peer MAC for smart-routing / hijack — prefer CONNECTED_DEVICES, else audio-source, else cache. */
     private fun peerMacAddresses(selfMacAddress: String): List<String> {
-        val fromList = connectedDevices.map { it.mac }.filter { it != selfMacAddress }
-        if (fromList.isNotEmpty()) return fromList.distinct()
+        fun usable(mac: String?) =
+            !mac.isNullOrEmpty() &&
+                mac != selfMacAddress &&
+                mac != "00:00:00:00:00:00"
+
+        val fromList = connectedDevices.map { it.mac }.filter { usable(it) }
+        if (fromList.isNotEmpty()) {
+            cachedPeerMacs = fromList.distinct()
+            return cachedPeerMacs
+        }
         val fromSource = audioSource?.mac
-        if (fromSource != null && fromSource != selfMacAddress) {
+        if (usable(fromSource)) {
             Log.d(TAG, "No CONNECTED_DEVICES peer — falling back to audio-source MAC $fromSource")
-            return listOf(fromSource)
+            cachedPeerMacs = listOf(fromSource!!)
+            return cachedPeerMacs
+        }
+        val cached = cachedPeerMacs.filter { usable(it) }
+        if (cached.isNotEmpty()) {
+            Log.d(TAG, "Using cached peer MAC(s) for hijack: $cached")
+            return cached
         }
         return emptyList()
     }
@@ -1360,6 +1382,7 @@ class AACPManager {
         oldConnectedDevices = listOf()
         connectedDevices = listOf()
         audioSource = null
+        // Keep cachedPeerMacs — needed for Hijackv2 on the next link before peer list arrives.
     }
 
     fun hasListeningModeStatus(): Boolean {

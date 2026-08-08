@@ -51,11 +51,36 @@ object MediaController {
     private const val PLAYBACK_DEBOUNCE_MS = 300L
     private var lastPlaybackCallbackAt: Long = 0L
     private var lastKnownIsMusicActive: Boolean? = null
+    /** WhatsApp status / ExoPlayer often play without AudioManager.isMusicActive. */
+    @Volatile private var lastClaimWorthyPlaybackAt: Long = 0L
+    private const val PLAYBACK_ACTIVE_HOLD_MS = 5_000L
 
-    private const val PAUSED_FOR_OTHER_DEVICE_CLEAR_MS = 500L
-    private val clearPausedForOtherDeviceRunnable = Runnable {
-        pausedForOtherDevice = false
-        Log.d("MediaController", "Cleared pausedForOtherDevice after timeout, resuming normal playback monitoring")
+    /**
+     * After Mac takes audio — hold long enough for Secondary AACP refresh (~28s) + pause settle.
+     * Short holds let residual NewPipe configs clear the flag and hard-claim Mac's stream.
+     */
+    private const val YIELD_TO_OTHER_DEVICE_HOLD_MS = 45_000L
+    private const val RECENTLY_LOST_OWNERSHIP_MS = 20_000L
+    private val clearPausedForOtherDeviceRunnable: Runnable = object : Runnable {
+        override fun run() {
+            // Stay yielded while coordinator still says Mac owns / Secondary.
+            val service = ServiceManager.getService()
+            if (service != null && service.shouldHoldYieldToOtherDevice()) {
+                handler.postDelayed(this, YIELD_TO_OTHER_DEVICE_HOLD_MS)
+                Log.d("MediaController", "Keeping pausedForOtherDevice — Mac/other still owns audio")
+                return
+            }
+            pausedForOtherDevice = false
+            Log.d(
+                "MediaController",
+                "Cleared pausedForOtherDevice after timeout, resuming normal playback monitoring"
+            )
+        }
+    }
+    private val clearRecentlyLostOwnershipRunnable = Runnable {
+        // Fixed window only — do not extend while Mac owns, or user play can never reclaim.
+        recentlyLostOwnership = false
+        Log.d("MediaController", "Cleared recentlyLostOwnership after yield hold")
     }
 
     private var relativeVolume: Boolean = false
@@ -123,7 +148,36 @@ object MediaController {
         override fun onPlaybackConfigChanged(configs: MutableList<AudioPlaybackConfiguration>?) {
             super.onPlaybackConfigChanged(configs)
             val now = SystemClock.uptimeMillis()
-            val isActive = audioManager.isMusicActive
+            val musicStreamActive = audioManager.isMusicActive
+
+            Log.d("MediaController", "Configs received: ${configs?.size ?: 0} configurations")
+            val startedClaimWorthy = configs?.any { config ->
+                // WhatsApp status / many video players: started player, often not MUSIC stream.
+                // PLAYER_STATE_STARTED = 2 (API 26+); older: presence in callback ≈ active.
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    val state = try {
+                        config.javaClass.getMethod("getPlayerState").invoke(config) as Int
+                    } catch (_: Exception) {
+                        2
+                    }
+                    if (state != 2) return@any false
+                }
+                val attrs = config.audioAttributes
+                if (attrs == null) {
+                    Log.d("MediaController", "Started player with no audioAttributes — treat as media")
+                    return@any true
+                }
+                Log.d(
+                    "MediaController",
+                    "Config content=${attrs.contentType} usage=${attrs.usage}"
+                )
+                isClaimWorthyPlayback(attrs)
+            } == true
+
+            val isActive = musicStreamActive || startedClaimWorthy
+            if (isActive) {
+                lastClaimWorthyPlaybackAt = now
+            }
 
             // Standby: BT off, or no L2CAP and no BLE presence → skip takeover / AACP chatter.
             val service = ServiceManager.getService()
@@ -137,7 +191,12 @@ object MediaController {
                 return
             }
 
-            Log.d("MediaController", "Playback config changed, iPausedTheMedia: $iPausedTheMedia, isActive: $isActive, pausedForOtherDevice: $pausedForOtherDevice, lastKnownIsMusicActive: $lastKnownIsMusicActive")
+            Log.d(
+                "MediaController",
+                "Playback config changed, iPausedTheMedia: $iPausedTheMedia, isActive: $isActive " +
+                    "(musicStream=$musicStreamActive claimWorthy=$startedClaimWorthy), " +
+                    "pausedForOtherDevice: $pausedForOtherDevice, lastKnownIsMusicActive: $lastKnownIsMusicActive"
+            )
 
             if (!isActive && lastPlayWithReplay && now - lastPlayTime < 2500L) {
                 Log.d("MediaController", "Music paused shortly after play with replay; retrying play")
@@ -147,7 +206,10 @@ object MediaController {
                 return
             }
 
-            if (now - lastPlaybackCallbackAt < PLAYBACK_DEBOUNCE_MS) {
+            // Never drop inactive→active play edges — debounce previously swallowed YouTube
+            // (USAGE_MEDIA + CONTENT_TYPE_UNKNOWN) and skipped hard claim → AACP died ~40s later.
+            val playEdgeCandidate = isActive && lastKnownIsMusicActive != true
+            if (!playEdgeCandidate && now - lastPlaybackCallbackAt < PLAYBACK_DEBOUNCE_MS) {
                 Log.d("MediaController", "Ignoring playback callback due to debounce (${now - lastPlaybackCallbackAt}ms)")
                 lastPlaybackCallbackAt = now
                 return
@@ -160,48 +222,39 @@ object MediaController {
                 return
             }
 
-            Log.d("MediaController", "Configs received: ${configs?.size ?: 0} configurations")
-            val currentActiveContentTypes = configs?.flatMap { config ->
-                Log.d("MediaController", "Processing config: ${config}, audioAttributes: ${config.audioAttributes}")
-                config.audioAttributes?.let { attrs ->
-                    val contentType = attrs.contentType
-                    Log.d("MediaController", "Config content type: $contentType")
-                    listOf(contentType)
-                } ?: run {
-                    Log.d("MediaController", "Config has no audioAttributes")
-                    emptyList()
-                }
-            }?.toSet() ?: emptySet()
+            // Claim on any started claim-worthy player, or MUSIC stream with empty configs.
+            val hasNewMusicOrMovie =
+                startedClaimWorthy || (musicStreamActive && (configs.isNullOrEmpty() || isActive))
 
-            Log.d("MediaController", "Current active content types: $currentActiveContentTypes")
-
-            val hasNewMusicOrMovie = currentActiveContentTypes.any { contentType ->
-                contentType == android.media.AudioAttributes.CONTENT_TYPE_MUSIC ||
-                contentType == android.media.AudioAttributes.CONTENT_TYPE_MOVIE
-            }
-
-            Log.d("MediaController", "Has new music or movie: $hasNewMusicOrMovie")
+            Log.d("MediaController", "Has media play signal: $hasNewMusicOrMovie")
 
             if (pausedForOtherDevice) {
-                handler.removeCallbacks(clearPausedForOtherDeviceRunnable)
-                handler.postDelayed(clearPausedForOtherDeviceRunnable, PAUSED_FOR_OTHER_DEVICE_CLEAR_MS)
+                // Do NOT reschedule with a short timeout — residual pause configs used to
+                // shrink the yield hold to 500ms and let keep-alive steal Mac audio.
+                val macStillOwns = service?.shouldHoldYieldToOtherDevice() == true
+                val truePlayEdge = isActive && lastKnownIsMusicActive != true && hasNewMusicOrMovie
 
-                if (isActive) {
-                    Log.d("MediaController", "Detected play while pausedForOtherDevice; attempting to take over")
-                    if (!recentlyLostOwnership && hasNewMusicOrMovie) {
-                        pausedForOtherDevice = false
-                        userPlayedTheMedia = true
-                        if (!pausedWhileTakingOver) {
-                            ServiceManager.getService()?.takeOver("music")
-                        }
-                    } else {
-                        Log.d("MediaController", "Skipping take-over due to recent ownership loss or no new music/movie")
+                // After the post-yield settle window, a real play edge reclaims (steals from Mac).
+                // recentlyLostOwnership blocks residual NewPipe configs right after our pause.
+                if (truePlayEdge && !recentlyLostOwnership) {
+                    Log.d(
+                        "MediaController",
+                        "User play while yielded — reclaiming (macStillOwns=$macStillOwns)"
+                    )
+                    pausedForOtherDevice = false
+                    userPlayedTheMedia = true
+                    if (!pausedWhileTakingOver) {
+                        requestMusicOwnershipClaim()
                     }
-                } else {
-                    Log.d("MediaController", "Still not active while pausedForOtherDevice; will clear state after timeout")
+                } else if (isActive) {
+                    Log.d(
+                        "MediaController",
+                        "Ignoring playback while yielded " +
+                            "(macStillOwns=$macStillOwns recentlyLost=$recentlyLostOwnership playEdge=$truePlayEdge)"
+                    )
                 }
 
-                lastKnownIsMusicActive = isActive
+                lastKnownIsMusicActive = isActive && hasNewMusicOrMovie
                 return
             }
 
@@ -214,8 +267,8 @@ object MediaController {
                 )
                 Log.d("MediaController", "User changed media state themselves; will wait for ear detection pause before auto-play")
                 handler.postDelayed({
-                    userPlayedTheMedia = audioManager.isMusicActive
-                    if (audioManager.isMusicActive) {
+                    userPlayedTheMedia = getLocalPlaybackActive()
+                    if (getLocalPlaybackActive()) {
                         pausedForOtherDevice = false
                     }
                 }, 7)
@@ -225,8 +278,8 @@ object MediaController {
             if (!pausedWhileTakingOver && isActive && hasNewMusicOrMovie) {
                 if (lastKnownIsMusicActive != true) {
                     if (!recentlyLostOwnership) {
-                        Log.d("MediaController", "Music/movie is active and not pausedWhileTakingOver; requesting takeOver")
-                        ServiceManager.getService()?.takeOver("music")
+                        Log.d("MediaController", "Media active — requesting ownership hard claim")
+                        requestMusicOwnershipClaim()
                     } else {
                         Log.d("MediaController", "Skipping take-over due to recent ownership loss")
                     }
@@ -237,9 +290,50 @@ object MediaController {
         }
     }
 
+    /**
+     * True for playback that should steal AirPods from Mac (music, video, WhatsApp status, …).
+     * Excludes alarms, notification sounds, UI ticks, and in-call voice.
+     */
+    private fun isClaimWorthyPlayback(attrs: android.media.AudioAttributes): Boolean {
+        when (attrs.usage) {
+            android.media.AudioAttributes.USAGE_ALARM,
+            android.media.AudioAttributes.USAGE_NOTIFICATION,
+            android.media.AudioAttributes.USAGE_NOTIFICATION_RINGTONE,
+            android.media.AudioAttributes.USAGE_NOTIFICATION_COMMUNICATION_REQUEST,
+            android.media.AudioAttributes.USAGE_NOTIFICATION_COMMUNICATION_INSTANT,
+            android.media.AudioAttributes.USAGE_NOTIFICATION_COMMUNICATION_DELAYED,
+            android.media.AudioAttributes.USAGE_NOTIFICATION_EVENT,
+            android.media.AudioAttributes.USAGE_ASSISTANCE_ACCESSIBILITY,
+            android.media.AudioAttributes.USAGE_ASSISTANCE_SONIFICATION,
+            android.media.AudioAttributes.USAGE_VOICE_COMMUNICATION,
+            android.media.AudioAttributes.USAGE_VOICE_COMMUNICATION_SIGNALLING -> return false
+        }
+        when (attrs.contentType) {
+            android.media.AudioAttributes.CONTENT_TYPE_SONIFICATION -> return false
+        }
+        return true
+    }
+
+    /** Play-edge → ownership coordinator when present; else legacy takeOver("music"). */
+    @RequiresApi(Build.VERSION_CODES.R)
+    private fun requestMusicOwnershipClaim() {
+        ServiceManager.getService()?.requestMusicOwnershipFromPlayEdge()
+    }
+
     @Synchronized
     fun getMusicActive(): Boolean {
         return audioManager.isMusicActive
+    }
+
+    /**
+     * Local media/video playback that should hard-claim AACP — includes players that do not
+     * set [AudioManager.isMusicActive] (WhatsApp status, many ExoPlayer video surfaces).
+     */
+    @Synchronized
+    fun getLocalPlaybackActive(): Boolean {
+        if (!this::audioManager.isInitialized) return false
+        if (audioManager.isMusicActive) return true
+        return SystemClock.uptimeMillis() - lastClaimWorthyPlaybackAt < PLAYBACK_ACTIVE_HOLD_MS
     }
 
     @Synchronized
@@ -291,10 +385,19 @@ object MediaController {
 
     @Synchronized
     fun sendPause(force: Boolean = false) {
-        Log.d("MediaController", "Sending pause with iPausedTheMedia: $iPausedTheMedia, userPlayedTheMedia: $userPlayedTheMedia, isMusicActive: ${audioManager.isMusicActive}, force: $force")
-        if ((audioManager.isMusicActive) && (!userPlayedTheMedia || force)) {
-            iPausedTheMedia = if (force) audioManager.isMusicActive else true
+        val streamActive = audioManager.isMusicActive
+        val localActive = getLocalPlaybackActive()
+        Log.d(
+            "MediaController",
+            "Sending pause with iPausedTheMedia: $iPausedTheMedia, userPlayedTheMedia: $userPlayedTheMedia, " +
+                "isMusicActive: $streamActive, localPlayback: $localActive, force: $force"
+        )
+        // WhatsApp status / video often have localActive but not isMusicActive — still pause.
+        if (force || ((streamActive || localActive) && !userPlayedTheMedia)) {
+            iPausedTheMedia = true
             userPlayedTheMedia = false
+            lastClaimWorthyPlaybackAt = 0L
+            lastKnownIsMusicActive = false
             audioManager.dispatchMediaKeyEvent(
                 KeyEvent(
                     KeyEvent.ACTION_DOWN,
@@ -309,6 +412,20 @@ object MediaController {
             )
             lastSelfActionAt = SystemClock.uptimeMillis()
         }
+    }
+
+    /** After Mac takes audio — block stale playback holds from re-triggering hard claim. */
+    @Synchronized
+    fun clearLocalPlaybackForYield() {
+        lastClaimWorthyPlaybackAt = 0L
+        lastKnownIsMusicActive = false
+        userPlayedTheMedia = false
+        pausedForOtherDevice = true
+        recentlyLostOwnership = true
+        handler.removeCallbacks(clearPausedForOtherDeviceRunnable)
+        handler.postDelayed(clearPausedForOtherDeviceRunnable, YIELD_TO_OTHER_DEVICE_HOLD_MS)
+        handler.removeCallbacks(clearRecentlyLostOwnershipRunnable)
+        handler.postDelayed(clearRecentlyLostOwnershipRunnable, RECENTLY_LOST_OWNERSHIP_MS)
     }
 
     @Synchronized
