@@ -99,6 +99,8 @@ class BLEManager(private val context: Context) {
     private var lastBroadcastTime: Long = 0
     private val processedAddresses = mutableSetOf<String>()
 
+    private val lastValidLeftBatteryMap = mutableMapOf<String, Int>()
+    private val lastValidRightBatteryMap = mutableMapOf<String, Int>()
     private val lastValidCaseBatteryMap = mutableMapOf<String, Int>()
     @Volatile private var isScanning = false
     @Volatile private var currentPowerMode = ScanPowerMode.LOW_POWER
@@ -454,10 +456,26 @@ class BLEManager(private val context: Context) {
         }
     }
 
-    private fun formatBattery(byteVal: Int): Pair<Boolean, Int> {
+    /**
+     * Decrypted proximity battery byte: bit7 = charging, bits0-6 = percent.
+     * 0x7F (127) is Apple's unknown/unavailable sentinel — not a real charge level.
+     */
+    private fun formatBattery(byteVal: Int): Pair<Boolean, Int?> {
         val charging = (byteVal and 0x80) != 0
         val level = byteVal and 0x7F
-        return Pair(charging, level)
+        return Pair(charging, level.takeIf { it in 0..100 })
+    }
+
+    private fun resolveBattery(
+        address: String,
+        level: Int?,
+        cache: MutableMap<String, Int>
+    ): Int? {
+        if (level != null) {
+            cache[address] = level
+            return level
+        }
+        return cache[address]
     }
 
     private fun processScanResult(result: ScanResult) {
@@ -572,18 +590,13 @@ class BLEManager(private val context: Context) {
         val leftByteIndex = if (isFlipped) 2 else 1
         val rightByteIndex = if (isFlipped) 1 else 2
 
-        val (isLeftCharging, leftBattery) = formatBattery(decrypted[leftByteIndex].toInt() and 0xFF)
-        val (isRightCharging, rightBattery) = formatBattery(decrypted[rightByteIndex].toInt() and 0xFF)
+        val (isLeftCharging, rawLeftBattery) = formatBattery(decrypted[leftByteIndex].toInt() and 0xFF)
+        val (isRightCharging, rawRightBattery) = formatBattery(decrypted[rightByteIndex].toInt() and 0xFF)
+        val (isCaseCharging, rawCaseBattery) = formatBattery(decrypted[3].toInt() and 0xFF)
 
-        val rawCaseBatteryByte = decrypted[3].toInt() and 0xFF
-        val (isCaseCharging, rawCaseBattery) = formatBattery(rawCaseBatteryByte)
-
-        val caseBattery = if (rawCaseBatteryByte == 0xFF || (isCaseCharging && rawCaseBattery == 127)) {
-            lastValidCaseBatteryMap[address]
-        } else {
-            lastValidCaseBatteryMap[address] = rawCaseBattery
-            rawCaseBattery
-        }
+        val leftBattery = resolveBattery(address, rawLeftBattery, lastValidLeftBatteryMap)
+        val rightBattery = resolveBattery(address, rawRightBattery, lastValidRightBatteryMap)
+        val caseBattery = resolveBattery(address, rawCaseBattery, lastValidCaseBatteryMap)
 
         val lidOpen = ((lid shr 3) and 0x01) == 0
 
@@ -615,6 +628,9 @@ class BLEManager(private val context: Context) {
 
         for (device in staleDevices) {
             deviceStatusMap.remove(device.key)
+            lastValidLeftBatteryMap.remove(device.key)
+            lastValidRightBatteryMap.remove(device.key)
+            lastValidCaseBatteryMap.remove(device.key)
             Log.d(TAG, "Removed stale device from tracking: ${device.key}")
         }
 

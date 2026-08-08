@@ -233,14 +233,19 @@ class AirPodsNotifications {
             caseLevel: Int?,
             caseCharging: Boolean
         ) {
+            // BLE proximity uses 0x7F (127) as "unknown"; never surface >100% in UI.
+            fun clamp(level: Int?): Int? = level?.takeIf { it in 0..100 }
             fun status(level: Int?, charging: Boolean) = when {
                 level == null -> BatteryStatus.DISCONNECTED
                 charging -> BatteryStatus.CHARGING
                 else -> BatteryStatus.NOT_CHARGING
             }
-            first = Battery(BatteryComponent.LEFT, leftLevel ?: 0, status(leftLevel, leftCharging))
-            second = Battery(BatteryComponent.RIGHT, rightLevel ?: 0, status(rightLevel, rightCharging))
-            case = Battery(BatteryComponent.CASE, caseLevel ?: 0, status(caseLevel, caseCharging))
+            val left = clamp(leftLevel)
+            val right = clamp(rightLevel)
+            val caseLvl = clamp(caseLevel)
+            first = Battery(BatteryComponent.LEFT, left ?: 0, status(left, leftCharging))
+            second = Battery(BatteryComponent.RIGHT, right ?: 0, status(right, rightCharging))
+            case = Battery(BatteryComponent.CASE, caseLvl ?: 0, status(caseLvl, caseCharging))
         }
 
         fun clear() {
