@@ -3,7 +3,7 @@ name: Android CI
 on:
   push:
     branches:
-      - 'personal/android-stability-and-features'
+      - 'personal/**'
     paths:
       - 'android/**'
       - 'root-module-manual/**'
@@ -240,5 +240,3 @@ jobs:
                 }
               ]
             }'
-
-# personal-branch releases
