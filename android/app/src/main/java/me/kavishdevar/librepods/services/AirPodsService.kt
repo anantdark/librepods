@@ -139,12 +139,23 @@ import kotlin.time.Duration.Companion.milliseconds
 
 private const val TAG = "AirPodsService"
 
+private val AIRPODS_PNP_UUID: ParcelUuid =
+    ParcelUuid.fromString("74ec2172-0bad-4d01-8f77-997b2be0722a")
+
+/** Addresses that got ACL_CONNECTED and are waiting on SDP UUID results. */
+private val pendingAirPodsAclAddresses: MutableSet<String> =
+    java.util.concurrent.ConcurrentHashMap.newKeySet()
+
 /** Classic BT devices only — name must contain "AirPods" (e.g. "Anant's AirPods"). */
 @SuppressLint("MissingPermission")
 private fun BluetoothDevice.isAirPodsByName(): Boolean {
     val n = name ?: return false
     return n.contains("AirPods", ignoreCase = true)
 }
+
+@SuppressLint("MissingPermission")
+private fun BluetoothDevice.hasAirPodsUuid(): Boolean =
+    uuids?.contains(AIRPODS_PNP_UUID) == true
 
 object ServiceManager {
     private var service: AirPodsService? = null
@@ -645,38 +656,44 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
         if (bluetoothAdapter?.isEnabled == true) {
             bluetoothAdapter.bondedDevices.forEach { device ->
                 if (!device.isAirPodsByName()) return@forEach
-                device.fetchUuidsWithSdp()
-                if (device.uuids != null) {
-                    if (device.uuids.contains(ParcelUuid.fromString("74ec2172-0bad-4d01-8f77-997b2be0722a"))) {
-                        bluetoothAdapter.getProfileProxy(
-                            this, object : BluetoothProfile.ServiceListener {
-                                @SuppressLint("NewApi")
-                                override fun onServiceConnected(profile: Int, proxy: BluetoothProfile) {
-                                    if (profile == BluetoothProfile.A2DP) {
-                                        val connectedDevices = proxy.connectedDevices
-                                        if (connectedDevices.isNotEmpty()) {
-                                            CoroutineScope(Dispatchers.IO).launch {
-                                                connectToSocket(bluetoothAdapter, device)
-                                            }
-                                            setMetadatas(device)
-                                            macAddress = device.address
-                                            sharedPreferences.edit {
-                                                putString("mac_address", macAddress)
-                                            }
-                                            sendBroadcast(
-                                                Intent(AirPodsNotifications.AIRPODS_CONNECTED).apply {
-                                                    setPackage(packageName)
-                                                })
-                                        }
-                                    }
-                                    bluetoothAdapter.closeProfileProxy(profile, proxy)
-                                }
-
-                                override fun onServiceDisconnected(profile: Int) {}
-                            }, BluetoothProfile.A2DP
-                        )
-                    }
+                if (!device.hasAirPodsUuid()) {
+                    device.fetchUuidsWithSdp()
+                    return@forEach
                 }
+                // Only if *this* AirPods device is on A2DP — not Sony/other headphones.
+                bluetoothAdapter.getProfileProxy(
+                    this, object : BluetoothProfile.ServiceListener {
+                        @SuppressLint("NewApi")
+                        override fun onServiceConnected(profile: Int, proxy: BluetoothProfile) {
+                            if (profile == BluetoothProfile.A2DP) {
+                                val airPodsA2dpConnected = proxy.connectedDevices.any {
+                                    it.address.equals(device.address, ignoreCase = true)
+                                }
+                                if (airPodsA2dpConnected) {
+                                    CoroutineScope(Dispatchers.IO).launch {
+                                        connectToSocket(bluetoothAdapter, device)
+                                    }
+                                    setMetadatas(device)
+                                    macAddress = device.address
+                                    sharedPreferences.edit {
+                                        putString("mac_address", macAddress)
+                                    }
+                                    // Do not broadcast AIRPODS_CONNECTED here — that alias is
+                                    // treated as L2CAP-up by the UI. connectToSocket emits it.
+                                } else {
+                                    Log.d(
+                                        TAG,
+                                        "Bonded AirPods present but not on A2DP " +
+                                            "(other audio device connected); skip L2CAP"
+                                    )
+                                }
+                            }
+                            bluetoothAdapter.closeProfileProxy(profile, proxy)
+                        }
+
+                        override fun onServiceDisconnected(profile: Int) {}
+                    }, BluetoothProfile.A2DP
+                )
             }
 
             MediaController.setMonitoringEnabled(true)
@@ -2618,33 +2635,36 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
                 ?.getString("name", bluetoothDevice?.name)
             if (bluetoothDevice != null && !action.isNullOrEmpty()) {
                 Log.d(TAG, "Received bluetooth connection broadcast: action=$action")
-                val uuid = ParcelUuid.fromString("74ec2172-0bad-4d01-8f77-997b2be0722a")
 
                 if (BluetoothDevice.ACTION_ACL_CONNECTED == action) {
                     if (!bluetoothDevice.isAirPodsByName()) {
                         Log.d(TAG, "Ignoring ACL_CONNECTED for non-AirPods: ${bluetoothDevice.name}")
-                    } else if (bluetoothDevice.uuids?.contains(uuid) == true) {
+                    } else if (bluetoothDevice.hasAirPodsUuid()) {
                         val detected = Intent(AirPodsNotifications.AIRPODS_CONNECTION_DETECTED)
                         detected.putExtra("name", name)
                         detected.putExtra("device", bluetoothDevice)
                         appContext?.sendBroadcast(detected)
                     } else {
+                        // Wait for SDP — do not treat later UUID events for idle bonded pods
+                        // as a connection (that falsely connects while Sony/etc. is active).
+                        pendingAirPodsAclAddresses.add(bluetoothDevice.address)
                         bluetoothDevice.fetchUuidsWithSdp()
                     }
+                } else if (BluetoothDevice.ACTION_ACL_DISCONNECTED == action) {
+                    pendingAirPodsAclAddresses.remove(bluetoothDevice.address)
                 } else if ("android.bluetooth.device.action.UUID" == action) {
                     if (!bluetoothDevice.isAirPodsByName()) {
                         Log.d(TAG, "Ignoring UUID event for non-AirPods: ${bluetoothDevice.name}")
-                    } else {
-                        val savedMac = appContext?.getSharedPreferences("settings", MODE_PRIVATE)
-                            ?.getString("mac_address", "") ?: ""
-                        val matchedByMac = savedMac.isNotEmpty() && bluetoothDevice.address == savedMac
-                        val matchedByUuid = bluetoothDevice.uuids?.contains(uuid) == true
-                        if (matchedByUuid || matchedByMac) {
-                            val detected = Intent(AirPodsNotifications.AIRPODS_CONNECTION_DETECTED)
-                            detected.putExtra("name", name)
-                            detected.putExtra("device", bluetoothDevice)
-                            appContext?.sendBroadcast(detected)
-                        }
+                    } else if (!pendingAirPodsAclAddresses.remove(bluetoothDevice.address)) {
+                        Log.d(
+                            TAG,
+                            "Ignoring UUID for AirPods without pending ACL: ${bluetoothDevice.name}"
+                        )
+                    } else if (bluetoothDevice.hasAirPodsUuid()) {
+                        val detected = Intent(AirPodsNotifications.AIRPODS_CONNECTION_DETECTED)
+                        detected.putExtra("name", name)
+                        detected.putExtra("device", bluetoothDevice)
+                        appContext?.sendBroadcast(detected)
                     }
                 }
             }
